@@ -1,0 +1,36 @@
+{{ tb0_banner }}
+:FileType tb0  ASCII
+#
+:WrittenBy          MESHflow
+:Version            {{ meshflow_version }}
+:CreationDate       {{ creation_date }}
+#
+:Projection         LATLONG
+#
+:StartTime          {{ start_time }}
+:DeltaT             {{ delta_t }}
+#
+{% if reservoirs -%}
+:ColumnMetaData
+   :ColumnType            {% for reservoir in reservoirs %}float{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ColumnUnits            {% for reservoir in reservoirs %}m3/s{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ColumnName            {% for reservoir in reservoirs %}{{ reservoir.name | mesh_reservoir_name }}{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ColumnModel            {% for reservoir in reservoirs %}LAKE{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ColumnLocationX      {% for reservoir in reservoirs %}{{ reservoir.lon | tb0_location }}{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ColumnLocationY       {% for reservoir in reservoirs %}{{ reservoir.lat | tb0_location }}{% if not loop.last %} {% endif %}{% endfor %}
+
+   :Coeff1             {% for reservoir in reservoirs %}{{ reservoir.b1 | tb0_coeff }}{% if not loop.last %} {% endif %}{% endfor %}
+
+   :Coeff2              {% for reservoir in reservoirs %}{{ reservoir.b2 | tb0_coeff }}{% if not loop.last %} {% endif %}{% endfor %}
+
+   :ReachArea          {% for reservoir in reservoirs %}{{ reservoir.reach_area | tb0_reach_area }}{% if not loop.last %} {% endif %}{% endfor %}
+
+
+:EndColumnMetaData
+{% endif -%}
+:endHeader

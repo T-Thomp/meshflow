@@ -1,0 +1,384 @@
+"""Unit tests for MESH_input_reservoir.txt generation."""
+
+import importlib.util
+import sys
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+from jinja2 import Environment, FileSystemLoader
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src" / "meshflow"
+UTILITY = SRC / "utility"
+TEMPLATES = SRC / "templates"
+
+
+def _load_reservoir_module():
+    spec = importlib.util.spec_from_file_location(
+        "meshflow_reservoir", UTILITY / "reservoir.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["meshflow_reservoir"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+reservoir = _load_reservoir_module()
+
+degrees_to_mesh_minutes = reservoir.degrees_to_mesh_minutes
+default_reservoir_name = reservoir.default_reservoir_name
+format_reservoir_header = reservoir.format_reservoir_header
+format_reservoir_line = reservoir.format_reservoir_line
+fortran_i5 = reservoir.fortran_i5
+fortran_f7_1 = reservoir.fortran_f7_1
+prepare_reservoir_context = reservoir.prepare_reservoir_context
+prepare_reservoir_inflows_context = reservoir.prepare_reservoir_inflows_context
+read_reservoir_coefficients = reservoir.read_reservoir_coefficients
+
+
+def render_reservoir_template(context: dict) -> str:
+    """Render the production Jinja template using the same filters as meshflow."""
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES),
+        trim_blocks=True,
+        lstrip_blocks=True,
+        line_comment_prefix="##",
+    )
+    env.filters["fortran_i5"] = reservoir.fortran_i5
+    env.filters["fortran_f7_1"] = reservoir.fortran_f7_1
+    env.filters["fortran_g10_3"] = reservoir.fortran_g10_3
+    env.filters["fortran_a12"] = reservoir.fortran_a12
+    env.filters["fortran_i2"] = reservoir.fortran_i2
+    env.filters["mesh_reservoir_name"] = reservoir.mesh_reservoir_name
+    env.filters["tb0_coeff"] = reservoir.tb0_coeff
+    env.filters["tb0_location"] = reservoir.tb0_location
+    env.filters["tb0_reach_area"] = reservoir.tb0_reach_area
+
+    content = env.get_template("MESH_input_reservoir.txt.jinja").render(**context)
+    return content if content.endswith("\n") else content + "\n"
+
+
+def render_reservoir_inflows_template(context: dict) -> str:
+    """Render the production inflows Jinja template using the same filters as meshflow."""
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES),
+        trim_blocks=True,
+        lstrip_blocks=True,
+        line_comment_prefix="##",
+    )
+    env.filters["mesh_reservoir_name"] = reservoir.mesh_reservoir_name
+    env.filters["tb0_coeff"] = reservoir.tb0_coeff
+    env.filters["tb0_location"] = reservoir.tb0_location
+    env.filters["tb0_reach_area"] = reservoir.tb0_reach_area
+
+    content = env.get_template("MESH_input_reservoir.tb0.jinja").render(**context)
+    return content if content.endswith("\n") else content + "\n"
+
+
+def _render_reservoir_file(**kwargs) -> str:
+    context = prepare_reservoir_context(**kwargs)
+    return render_reservoir_template(context)
+
+
+def test_normalize_reservoir_file_format_defaults_to_txt():
+    assert reservoir.normalize_reservoir_file_format(None) == ("txt", False)
+    assert reservoir.normalize_reservoir_file_format("txt") == ("txt", False)
+    assert reservoir.normalize_reservoir_file_format("TB0") == ("tb0", False)
+
+
+def test_mesh_timestep_delta_t_hours_matches_model_timestep():
+    assert reservoir.mesh_timestep_delta_t_hours(60) == "1"
+    assert reservoir.mesh_timestep_delta_t_hours(30) == "0.5"
+    assert reservoir.mesh_timestep_delta_t_hours(120) == "2"
+
+
+def test_normalize_reservoir_file_format_warns_on_invalid_values():
+    assert reservoir.normalize_reservoir_file_format("csv") == ("txt", True)
+    assert reservoir.normalize_reservoir_file_format("") == ("txt", False)
+
+
+def test_degrees_to_mesh_minutes():
+    assert degrees_to_mesh_minutes(51.178) == 3070.68
+
+
+def test_reservoir_header_matches_dummy_file():
+    assert format_reservoir_header(0) == "    0     0     0"
+    assert format_reservoir_header(3) == "    3     0     0"
+
+
+def test_format_reservoir_line_locationflag_zero():
+    line = format_reservoir_line(
+        lat_min=3066.0,
+        lon_min=-6906.0,
+        b1=0.0,
+        b2=0.0,
+        name="102",
+        ireach_num=1,
+        location_flag=0,
+    )
+
+    assert line == (
+        " 3066 -6906      0.000      0.000"
+        "                         102           1"
+    )
+
+
+def test_format_reservoir_line_locationflag_one():
+    line = format_reservoir_line(
+        lat_min=3066.68,
+        lon_min=-6906.12,
+        b1=0.15,
+        b2=0.25,
+        name="Ghost Lake",
+        ireach_num=2,
+        location_flag=1,
+    )
+
+    assert line == (
+        " 3066.7 -6906.1      0.150      0.250"
+        "                         Ghost Lake    2"
+    )
+
+
+def test_jinja_reservoir_file_strict_locationflag_zero():
+    cat = pd.DataFrame(
+        {
+            "COMID": [101, 102, 103],
+            "IREACH": [0, 1, 2],
+        }
+    )
+    coords = pd.DataFrame(
+        {
+            "COMID": [101, 102, 103],
+            "lat": [51.0, 51.1, 51.2],
+            "lon": [-115.0, -115.1, -115.2],
+        }
+    )
+
+    text = _render_reservoir_file(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        location_flag=0,
+    )
+
+    lines = text.rstrip("\n").splitlines()
+    assert lines[0] == "    2     0     0"
+    assert lines[1] == format_reservoir_line(
+        lat_min=3066.0,
+        lon_min=-6906.0,
+        b1=0.0,
+        b2=0.0,
+        name=default_reservoir_name(102),
+        ireach_num=1,
+        location_flag=0,
+    )
+
+
+def test_jinja_reservoir_file_uses_csv_coefficients(tmp_path):
+    cat = pd.DataFrame({"COMID": [101], "IREACH": [1]})
+    coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "COMID,name,b1,b2\n"
+        "101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+
+    text = _render_reservoir_file(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        location_flag=1,
+    )
+
+    lines = text.rstrip("\n").splitlines()
+    assert lines[0] == "    1     0     0"
+    assert lines[1] == (
+        " 3000.0 -6840.0      0.150      0.250"
+        "                         Ghost Lake    1"
+    )
+    assert default_reservoir_name(999) == "999"
+
+
+def test_jinja_reservoir_file_zeros_coefficients_for_flag_three(tmp_path):
+    cat = pd.DataFrame({"COMID": [101], "IREACH": [1]})
+    coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "COMID,name,b1,b2\n"
+        "101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+
+    context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        location_flag=0,
+        use_power_coefficients=False,
+    )
+    text = render_reservoir_template(context)
+
+    assert context["reservoirs"][0]["b1"] == 0.0
+    assert context["reservoirs"][0]["b2"] == 0.0
+    assert context["reservoirs"][0]["name"] == "Ghost Lake"
+    assert "      0.000      0.000                         " in text
+    assert "      0.150" not in text
+
+
+def test_prepare_reservoir_context_uses_lake_area_when_available():
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "lake_area": [11600000.0],
+        }
+    )
+    coords = pd.DataFrame({"COMID": [101], "lat": [51.21], "lon": [-114.7]})
+
+    context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        lake_area_col="lake_area",
+        subbasin_areas={101: 5000000.0},
+    )
+
+    assert context["reservoirs"][0]["reach_area"] == 11600000.0
+
+
+def test_prepare_reservoir_context_falls_back_to_subbasin_area():
+    cat = pd.DataFrame({"COMID": [101], "IREACH": [1]})
+    coords = pd.DataFrame({"COMID": [101], "lat": [51.21], "lon": [-114.7]})
+
+    context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        subbasin_areas={101: 7402235.0},
+    )
+
+    assert context["reservoirs"][0]["reach_area"] == 7402235.0
+
+
+def test_jinja_reservoir_inflows_matches_example_layout(tmp_path):
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "lake_area": [11600000.0],
+        }
+    )
+    coords = pd.DataFrame({"COMID": [101], "lat": [51.21], "lon": [-114.7]})
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "COMID,name,b1,b2\n"
+        "101,Ghost,3.5e-14,2.0\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+
+    reservoir_context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        lake_area_col="lake_area",
+        subbasin_areas={101: 5000000.0},
+    )
+    inflows_context = prepare_reservoir_inflows_context(
+        reservoir_context,
+        start_time="1980/01/01 00:00",
+        delta_t="1",
+        meshflow_version="v0.2.0-dev",
+    )
+    text = render_reservoir_inflows_template(inflows_context)
+
+    assert ":FileType tb0  ASCII" in text
+    assert ":WrittenBy          MESHflow" in text
+    assert ":Version            v0.2.0-dev" in text
+    assert f":CreationDate       {date.today().isoformat()}" in text
+    assert ":StartTime          1980/01/01 00:00" in text
+    assert ":DeltaT             1" in text
+    assert ":Application" not in text
+    assert ":RoutingDeltaT" not in text
+    assert ":FillFlag" not in text
+    assert text.splitlines()[0] == "########################################"
+    assert "   :ColumnName            Ghost" in text
+    assert "   :ColumnLocationX      -114.7" in text
+    assert "   :ColumnLocationY       51.21" in text
+    assert "   :Coeff1             3.50E-14" in text
+    assert "   :Coeff2              2.0E+00" in text
+    assert "   :ReachArea          11600000" in text
+    assert text.count(":ColumnMetaData") == 1
+    assert text.count(":EndColumnMetaData") == 1
+    assert text.rstrip().endswith(":endHeader")
+
+
+def test_jinja_reservoir_inflows_uses_single_column_metadata_block(tmp_path):
+    cat = pd.DataFrame(
+        {
+            "COMID": [101, 102],
+            "IREACH": [1, 2],
+            "lake_area": [11600000.0, 5000000.0],
+        }
+    )
+    coords = pd.DataFrame(
+        {
+            "COMID": [101, 102],
+            "lat": [51.21, 51.30],
+            "lon": [-114.7, -115.0],
+        }
+    )
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "COMID,name,b1,b2\n"
+        "101,Ghost,3.5e-14,2.0\n"
+        "102,Lake2,1.0,1.0\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+
+    reservoir_context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        lake_area_col="lake_area",
+        subbasin_areas={101: 5000000.0, 102: 4000000.0},
+    )
+    inflows_context = prepare_reservoir_inflows_context(
+        reservoir_context,
+        start_time="1980/01/01 00:00",
+        delta_t="1",
+        meshflow_version="v0.2.0-dev",
+    )
+    text = render_reservoir_inflows_template(inflows_context)
+
+    assert text.count(":ColumnMetaData") == 1
+    assert text.count(":EndColumnMetaData") == 1
+    assert "   :ColumnName            Ghost Lake2" in text
+    assert "   :ColumnLocationX      -114.7 -115" in text
+    assert "   :ColumnLocationY       51.21 51.3" in text
+    assert "   :Coeff1             3.50E-14 1.0E+00" in text
+    assert "   :Coeff2              2.0E+00 1.0E+00" in text
+    assert "   :ReachArea          11600000 5000000" in text
+
+
+def test_tb0_coeff_matches_mesh_example_format():
+    assert reservoir.tb0_coeff(3.5e-14) == "3.50E-14"
+    assert reservoir.tb0_coeff(2.0) == "2.0E+00"
+    assert reservoir.tb0_coeff(0.0) == "0.0E+00"
+
+
+def test_fortran_g10_3_uses_scientific_for_extreme_values():
+    assert len(reservoir.fortran_g10_3(0.15)) == 10
+    assert reservoir.fortran_g10_3(0.15) == "     0.150"
+    assert reservoir.fortran_g10_3(2.0) == "     2.000"
+    assert reservoir.fortran_g10_3(3.5e-14) == "  3.50E-14"
+    assert reservoir.fortran_g10_3(0.000005166) == "  5.17E-06"
+    assert reservoir.fortran_g10_3(21568734) == "  2.16E+07"
+    assert "E" in reservoir.fortran_g10_3(3.5e-14)
+    assert "e" not in reservoir.fortran_g10_3(3.5e-14)

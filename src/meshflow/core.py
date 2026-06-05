@@ -54,7 +54,7 @@ from ._default_dicts import (
     mesh_drainage_database_minimums_default,
     mesh_drainage_database_names_default,
 )
-from . import utility
+from . import __version__, utility
 
 from .utility import parameters_local_attrs as DEFAULT_PARAMTETERS_LOCAL_ATTRS
 from .utility.utils import expand_grouped_keys
@@ -397,6 +397,12 @@ class MESHWorkflow(object):
             raise ValueError("`settings['core']['landcover_mode']` must be "
                              "either 'fractional' or 'majority' (or 'mode')")
         self.landcover_mode = _lc_mode
+
+        _core_settings = self.settings.get('core', {})
+        self.reservoir_coefficients = _core_settings.get('reservoir_coefficients')
+        self.reservoir_coefficient_columns = _core_settings.get(
+            'reservoir_coefficient_columns', {}
+        )
 
         # assing inputs read from files
         self._read_input_files()
@@ -881,6 +887,8 @@ class MESHWorkflow(object):
         # Generate a parameters file for MESH (MESH_parameters.nc)
         # FIXME: needs to be generalized later on to accept soil parameters as well
 
+        self.init_reservoir()
+
         return
 
     def init(
@@ -944,6 +952,13 @@ class MESHWorkflow(object):
         if not self.ddb_vars:
             raise ValueError("`ddb_vars` cannot be empty")
 
+        # compute IREACH
+        if "ireach" in self.ddb_vars:
+            self._compute_ireach(
+                lake_col=self.ddb_vars["ireach"],
+                output_col="IREACH",
+            )
+
         # Creating local dictionaries for drainage database variables
         ddb_vars_renamed = {}
         ddb_units_renamed = {}
@@ -953,6 +968,8 @@ class MESHWorkflow(object):
         # Based on the input `ddb_vars`, adjust the names with MESH standard
         # values
         for k, v in self.ddb_vars.items():
+            if k == "ireach":
+                continue
             if k in mesh_drainage_database_names_default:
                 ddb_vars_renamed[v] = mesh_drainage_database_names_default[k]
             # if not in the default names, keep the original name
@@ -965,6 +982,11 @@ class MESHWorkflow(object):
                 ddb_vars_renamed[v] = v
         # Similarly for the `landclass` variable, while its naming scheme is
         # an outlier
+        if "ireach" in self.ddb_vars:
+            ddb_vars_renamed["IREACH"] = "IREACH"
+            ddb_units_renamed["IREACH"] = mesh_drainage_database_units_default[
+                "ireach"
+            ]
         ddb_vars_renamed['landclass'] = mesh_drainage_database_names_default['landclass']
         ddb_vars_renamed['area'] = 'GridArea' # FIXME: this needs to be automated
 
@@ -1008,6 +1030,11 @@ class MESHWorkflow(object):
         # ad-hoc manipulations on the drainage database
         self.ddb = self._adhoc_mesh_vars(self.ddb)
 
+        if "ireach" in self.ddb_vars:
+            self.ddb["IREACH"] = (
+                self.ddb["IREACH"].fillna(0).astype(np.int32)
+            )
+
         # assign the `GridArea` units attributes
         # FIXME: this needs to be changed to pint's
         #        `pint.Quantity` object
@@ -1017,6 +1044,276 @@ class MESHWorkflow(object):
             return self.ddb
         else:
             return
+
+    def init_reservoir(
+        self,
+        return_text: bool = False,
+    ) -> Optional[str]:
+        """
+        Build reservoir input files for lakes and reservoirs.
+
+        Writes ``MESH_input_reservoir.txt`` by default, or
+        ``MESH_input_reservoir.tb0`` when ``RESERVOIRFILEFLAG`` is ``tb0``,
+        when ``RESERVOIRFLAG`` is ``1`` or ``3`` in
+        ``settings['run_options']['flags']`` and ``ireach`` is included in
+        ``ddb_vars``. With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve
+        coefficients are optionally read from
+        ``settings['core']['reservoir_coefficients']``. With ``RESERVOIRFLAG``
+        ``3``, the same file is written but ``WF_B1`` and ``WF_B2`` are
+        always zero.
+
+        Reach areas in the ``.tb0`` file use ``ddb_vars['lake_area']`` when
+        mapped on the catchment shapefile; otherwise the subbasin
+        ``GridArea`` is used.
+
+        Parameters
+        ----------
+        return_text : bool, optional
+            If True, return the active reservoir file contents instead of
+            assigning to ``self.reservoir_text`` or
+            ``self.reservoir_inflows_text``.
+
+        Returns
+        -------
+        str or None
+            Active reservoir file contents when ``return_text`` is True;
+            otherwise None.
+        """
+        self.reservoir_file_format = self._reservoir_file_format()
+
+        if "ireach" not in self.ddb_vars:
+            self.reservoir_text = None
+            self.reservoir_inflows_text = None
+            dummy = utility.render_reservoir_template(
+                {"n_reservoirs": 0, "location_flag": self._location_flag(), "reservoirs": []}
+            )
+            return dummy if return_text else None
+
+        if not self._reservoir_flag_enabled():
+            self.reservoir_text = None
+            self.reservoir_inflows_text = None
+            dummy = utility.render_reservoir_template(
+                {"n_reservoirs": 0, "location_flag": self._location_flag(), "reservoirs": []}
+            )
+            return dummy if return_text else None
+
+        if "IREACH" not in self.cat.columns:
+            raise RuntimeError(
+                "`init_reservoir()` requires `IREACH` on `self.cat`. "
+                "Run `init_ddb()` first."
+            )
+
+        coefficients = None
+        if self.reservoir_coefficients:
+            coefficients = utility.read_reservoir_coefficients(
+                csv_path=self.reservoir_coefficients,
+                main_id=self.main_id,
+                **self.reservoir_coefficient_columns,
+            )
+
+        reservoir_context = utility.prepare_reservoir_context(
+            cat=self.cat,
+            coords=self.coords,
+            main_id=self.main_id,
+            lake_col="IREACH",
+            coefficients=coefficients,
+            location_flag=self._location_flag(),
+            use_power_coefficients=self._reservoir_flag() == 1,
+            lake_area_col=self._lake_area_col(),
+            subbasin_areas=self._subbasin_areas(),
+        )
+        self.reservoir_text = None
+        self.reservoir_inflows_text = None
+
+        if self.reservoir_file_format == "tb0":
+            inflows_context = utility.prepare_reservoir_inflows_context(
+                reservoir_context,
+                start_time=self._reservoir_start_time(),
+                delta_t=utility.mesh_timestep_delta_t_hours(
+                    self._model_timestep_minutes()
+                ),
+                meshflow_version=__version__,
+            )
+            self.reservoir_inflows_text = utility.render_reservoir_inflows_template(
+                inflows_context
+            )
+        else:
+            self.reservoir_text = utility.render_reservoir_template(
+                reservoir_context
+            )
+
+        if return_text:
+            if self.reservoir_file_format == "tb0":
+                return self.reservoir_inflows_text
+            return self.reservoir_text
+        return None
+
+    def _read_reservoir_file_format_raw(self) -> Any:
+        """Return the configured ``RESERVOIRFILEFLAG`` value, if present."""
+        run_options = self.settings.get("run_options", {})
+        flags = run_options.get("flags", {})
+
+        for group in flags.values():
+            if not isinstance(group, dict):
+                continue
+            if "RESERVOIRFILEFLAG" in group:
+                return group.get("RESERVOIRFILEFLAG")
+
+        if hasattr(self, "options_dict"):
+            etc_flags = self.options_dict.get("settings", {}).get("flags", {}).get("etc", {})
+            if "RESERVOIRFILEFLAG" in etc_flags:
+                return etc_flags.get("RESERVOIRFILEFLAG")
+
+        return None
+
+    def _sync_reservoir_file_format_flag(self, file_format: str) -> None:
+        """Persist the normalized ``RESERVOIRFILEFLAG`` in run options."""
+        run_options = self.settings.setdefault("run_options", {})
+        flags = run_options.setdefault("flags", {})
+        etc_flags = flags.setdefault("etc", {})
+        etc_flags["RESERVOIRFILEFLAG"] = file_format
+
+        if hasattr(self, "options_dict"):
+            etc = (
+                self.options_dict
+                .setdefault("settings", {})
+                .setdefault("flags", {})
+                .setdefault("etc", {})
+            )
+            etc["RESERVOIRFILEFLAG"] = file_format
+            if hasattr(self, "run_options_text"):
+                self.run_options_text = utility.render_run_options_template(
+                    self.options_dict
+                )
+
+    def _reservoir_file_format(self) -> str:
+        """Return the active ``RESERVOIRFILEFLAG`` value (``txt`` or ``tb0``)."""
+        if hasattr(self, "_reservoir_file_format_value"):
+            return self._reservoir_file_format_value
+
+        raw_flag = self._read_reservoir_file_format_raw()
+        file_format, corrected = utility.normalize_reservoir_file_format(raw_flag)
+        if corrected:
+            warnings.warn(
+                f"Unsupported RESERVOIRFILEFLAG `{raw_flag}`. "
+                "Defaulting to `txt`.",
+                UserWarning,
+            )
+
+        self._sync_reservoir_file_format_flag(file_format)
+        self._reservoir_file_format_value = file_format
+        return file_format
+
+    def _lake_area_col(self) -> Optional[str]:
+        """Return the catchment column mapped to lake reach area, if any."""
+        return self.ddb_vars.get("lake_area")
+
+    def _subbasin_areas(self) -> Optional[Dict[Any, float]]:
+        """Return subbasin areas keyed by ``main_id`` from the drainage database."""
+        if not hasattr(self, "ddb") or self.ddb is None or "GridArea" not in self.ddb:
+            return None
+
+        return dict(
+            zip(
+                self.ddb[self.hru_dim].values,
+                self.ddb["GridArea"].values,
+            )
+        )
+
+    def _model_timestep_minutes(self) -> float:
+        """Return the model timestep from ``TIMESTEPFLAG`` in minutes."""
+        run_options = self.settings.get("run_options", {})
+        flags = run_options.get("flags", {})
+
+        for group in flags.values():
+            if not isinstance(group, dict):
+                continue
+            if "TIMESTEPFLAG" in group:
+                value = group.get("TIMESTEPFLAG")
+                if value not in (None, ""):
+                    return float(value)
+
+        if hasattr(self, "options_dict"):
+            etc_flags = (
+                self.options_dict
+                .get("settings", {})
+                .get("flags", {})
+                .get("etc", {})
+            )
+            value = etc_flags.get("TIMESTEPFLAG")
+            if value not in (None, ""):
+                return float(value)
+
+        return 60.0
+
+    def _reservoir_start_time(self) -> str:
+        """Return the reservoir start time for ``MESH_input_reservoir.tb0``."""
+        core_settings = self.settings.get("core", {})
+        if "simulation_start_date" in core_settings:
+            start_date = core_settings["simulation_start_date"]
+        elif "forcing_start_date" in core_settings:
+            start_date = core_settings["forcing_start_date"]
+        else:
+            start_date = "1980-01-01 00:00:00"
+
+        return self.format_date(start_date, "%Y/%m/%d %H:%M")
+
+    def _reservoir_flag(self) -> Optional[int]:
+        """Return the active ``RESERVOIRFLAG`` value, if lakes are enabled."""
+        run_options = self.settings.get('run_options', {})
+        flags = run_options.get('flags', {})
+
+        for group in flags.values():
+            if not isinstance(group, dict):
+                continue
+            flag = self._normalize_reservoir_flag(group.get('RESERVOIRFLAG'))
+            if flag is not None:
+                return flag
+
+        if hasattr(self, 'options_dict'):
+            etc_flags = self.options_dict.get('flags', {}).get('etc', {})
+            flag = self._normalize_reservoir_flag(etc_flags.get('RESERVOIRFLAG'))
+            if flag is not None:
+                return flag
+
+        return None
+
+    @staticmethod
+    def _normalize_reservoir_flag(flag: Any) -> Optional[int]:
+        """Return a supported ``RESERVOIRFLAG`` value, if present."""
+        if flag is None:
+            return None
+        try:
+            flag_int = int(flag)
+        except (TypeError, ValueError):
+            return None
+        if flag_int in utility.RESERVOIR_INPUT_FLAGS:
+            return flag_int
+        return None
+
+    def _reservoir_flag_enabled(self) -> bool:
+        """Return True when run options request reservoir input generation."""
+        return self._reservoir_flag() is not None
+
+    def _location_flag(self) -> int:
+        """Return MESH ``LOCATIONFLAG`` (0 = i5 locations, 1 = f7.1)."""
+        run_options = self.settings.get('run_options', {})
+        flags = run_options.get('flags', {})
+
+        for group in flags.values():
+            if not isinstance(group, dict):
+                continue
+            flag = group.get('LOCATIONFLAG')
+            if flag is not None:
+                return int(flag)
+
+        if hasattr(self, 'options_dict'):
+            etc_flags = self.options_dict.get('flags', {}).get('etc', {})
+            flag = etc_flags.get('LOCATIONFLAG')
+            if flag is not None:
+                return int(flag)
+
+        return 0
 
     def init_forcing(
         self,
@@ -2037,6 +2334,23 @@ class MESHWorkflow(object):
             if os.path.isfile(f):
                 shutil.copy2(f, output_dir)
 
+        if getattr(self, 'reservoir_text', None) is None:
+            if (
+                "ireach" in self.ddb_vars
+                and "IREACH" in getattr(self, "cat", pd.DataFrame()).columns
+            ):
+                self.init_reservoir()
+
+        if getattr(self, 'reservoir_text', None):
+            reservoir_file = 'MESH_input_reservoir.txt'
+            with open(os.path.join(output_dir, reservoir_file), 'w') as f:
+                f.write(self.reservoir_text)
+
+        if getattr(self, 'reservoir_inflows_text', None):
+            reservoir_inflows_file = 'MESH_input_reservoir.tb0'
+            with open(os.path.join(output_dir, reservoir_inflows_file), 'w') as f:
+                f.write(self.reservoir_inflows_text)
+
         # save the class text file
         class_file = 'MESH_parameters_CLASS.ini'
         with open(os.path.join(output_dir, class_file), 'w') as f:
@@ -2125,6 +2439,60 @@ class MESHWorkflow(object):
 
         return _reordered_riv
 
+    def _compute_ireach(
+        self,
+        lake_col: str,
+        output_col: str = "IREACH",
+    ) -> None:
+        """
+        Build MESH IREACH on catchments from a 0/1 lake flag.
+    Lakes are numbered 1, 2, 3, ... in river traversal order
+        (``self.main_seg``). Non-lake basins get 0.
+        Parameters
+        ----------
+        lake_col : str
+            Column on ``self.cat`` with lake indicator (0 = not lake, non-zero = lake).
+        output_col : str, optional
+            Column name written on ``self.cat`` (default ``IREACH``).
+        Notes
+        -----
+        Call from ``init_ddb()`` after ``init()`` so ``self.main_seg`` exists.
+        """
+        if lake_col not in self.cat.columns:
+            raise ValueError(
+                f"Lake column `{lake_col}` not found in catchment data. "
+                f"Available columns: {list(self.cat.columns)}"
+            )
+        if not hasattr(self, "main_seg"):
+            raise RuntimeError(
+                "`_compute_ireach` requires `init()` to be run first (need `main_seg`)."
+            )
+        cat = self.cat.copy()
+        lake_by_id = cat.set_index(self.main_id)[lake_col]
+        # One value per basin ID (warn if duplicates disagree)
+        if lake_by_id.index.duplicated().any():
+            lake_by_id = lake_by_id.groupby(level=0).max()
+        lake_by_id = lake_by_id.fillna(0)
+        lake_by_id = (lake_by_id != 0).astype(np.int32)
+        # Unique basin IDs in river order; number lakes 1..N
+        ireach_map = {}
+        next_id = 1
+        seen = set()
+        for basin_id in self.main_seg:
+            if basin_id in seen:
+                continue
+            seen.add(basin_id)
+            if lake_by_id.get(basin_id, 0) == 1:
+                ireach_map[basin_id] = next_id
+                next_id += 1
+        cat[output_col] = (
+            cat[self.main_id]
+            .map(ireach_map)
+            .fillna(0)
+            .astype(np.int32)
+        )
+        self.cat = cat
+        
     def _modify_forcing_encodings(
         self,
         ds: xr.Dataset = None,
