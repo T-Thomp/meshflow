@@ -966,9 +966,12 @@ class MESHWorkflow(object):
         ddb_min_values_renamed = {}
 
         # Based on the input `ddb_vars`, adjust the names with MESH standard
-        # values
+        # values. `ireach` and `reservoir_id` are metadata mappings used to
+        # derive IREACH / join reservoir coefficients; they are not rewritten
+        # into MESH drainage-database variable names here.
+        _ddb_meta_keys = {"ireach", "reservoir_id"}
         for k, v in self.ddb_vars.items():
-            if k == "ireach":
+            if k in _ddb_meta_keys:
                 continue
             if k in mesh_drainage_database_names_default:
                 ddb_vars_renamed[v] = mesh_drainage_database_names_default[k]
@@ -1056,11 +1059,14 @@ class MESHWorkflow(object):
         ``MESH_input_reservoir.tb0`` when ``RESERVOIRFILEFLAG`` is ``tb0``,
         when ``RESERVOIRFLAG`` is ``1`` or ``3`` in
         ``settings['run_options']['flags']`` and ``ireach`` is included in
-        ``ddb_vars``. With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve
+        ``ddb_vars``.         With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve
         coefficients are optionally read from
-        ``settings['core']['reservoir_coefficients']``. With ``RESERVOIRFLAG``
-        ``3``, the same file is written but ``WF_B1`` and ``WF_B2`` are
-        always zero.
+        ``settings['core']['reservoir_coefficients']``. Coefficients can be
+        joined on a ``reservoir_id`` column mapped through ``ddb_vars``
+        (default), or on the catchment ``main_id`` when ``basin_id`` is
+        specified in ``reservoir_coefficient_columns``. With
+        ``RESERVOIRFLAG`` ``3``, the same file is written but ``WF_B1`` and
+        ``WF_B2`` are always zero.
 
         Reach areas in the ``.tb0`` file use ``ddb_vars['lake_area']`` when
         mapped on the catchment shapefile; otherwise the subbasin
@@ -1104,12 +1110,26 @@ class MESHWorkflow(object):
             )
 
         coefficients = None
+        coeff_link_key = "reservoir_id"
+        coeff_link_col = None
         if self.reservoir_coefficients:
+            coeff_link_key, csv_id_col = utility.parse_reservoir_coefficient_link(
+                self.reservoir_coefficient_columns,
+                self.main_id,
+            )
+            column_kwargs = {
+                key: value
+                for key, value in self.reservoir_coefficient_columns.items()
+                if key not in utility.RESERVOIR_LINK_KEYS
+            }
             coefficients = utility.read_reservoir_coefficients(
                 csv_path=self.reservoir_coefficients,
                 main_id=self.main_id,
-                **self.reservoir_coefficient_columns,
+                link_key=coeff_link_key,
+                id_col=csv_id_col,
+                **column_kwargs,
             )
+            coeff_link_col = self._reservoir_coeff_link_col(coeff_link_key)
 
         reservoir_context = utility.prepare_reservoir_context(
             cat=self.cat,
@@ -1121,6 +1141,8 @@ class MESHWorkflow(object):
             use_power_coefficients=self._reservoir_flag() == 1,
             lake_area_col=self._lake_area_col(),
             subbasin_areas=self._subbasin_areas(),
+            coeff_link_key=coeff_link_key,
+            coeff_link_col=coeff_link_col,
         )
         self.reservoir_text = None
         self.reservoir_inflows_text = None
@@ -1207,6 +1229,26 @@ class MESHWorkflow(object):
     def _lake_area_col(self) -> Optional[str]:
         """Return the catchment column mapped to lake reach area, if any."""
         return self.ddb_vars.get("lake_area")
+
+    def _reservoir_id_col(self) -> Optional[str]:
+        """Return the catchment column mapped to reservoir ID, if any."""
+        return self.ddb_vars.get("reservoir_id")
+
+    def _reservoir_coeff_link_col(self, link_key: str) -> str:
+        """Return the catchment column used to join reservoir coefficients."""
+        if link_key == "basin_id":
+            return self.main_id
+
+        coeff_col = self._reservoir_id_col()
+        if coeff_col is None:
+            raise ValueError(
+                "Reservoir coefficients use `reservoir_id` linking by default. "
+                "Add `reservoir_id` to `ddb_vars` with the catchment "
+                "shapefile column name, or set "
+                "`reservoir_coefficient_columns` to "
+                "`{'basin_id': '<parameter_column>'}`."
+            )
+        return coeff_col
 
     def _subbasin_areas(self) -> Optional[Dict[Any, float]]:
         """Return subbasin areas keyed by ``main_id`` from the drainage database."""

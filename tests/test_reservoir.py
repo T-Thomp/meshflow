@@ -35,6 +35,7 @@ fortran_f7_1 = reservoir.fortran_f7_1
 prepare_reservoir_context = reservoir.prepare_reservoir_context
 prepare_reservoir_inflows_context = reservoir.prepare_reservoir_inflows_context
 read_reservoir_coefficients = reservoir.read_reservoir_coefficients
+parse_reservoir_coefficient_link = reservoir.parse_reservoir_coefficient_link
 
 
 def render_reservoir_template(context: dict) -> str:
@@ -177,12 +178,18 @@ def test_jinja_reservoir_file_strict_locationflag_zero():
 
 
 def test_jinja_reservoir_file_uses_csv_coefficients(tmp_path):
-    cat = pd.DataFrame({"COMID": [101], "IREACH": [1]})
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "reservoir_id": ["R-101"],
+        }
+    )
     coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
     csv_path = tmp_path / "reservoirs.csv"
     csv_path.write_text(
-        "COMID,name,b1,b2\n"
-        "101,Ghost Lake,0.15,0.25\n"
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
     )
     coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
 
@@ -191,6 +198,7 @@ def test_jinja_reservoir_file_uses_csv_coefficients(tmp_path):
         coords=coords,
         main_id="COMID",
         coefficients=coefficients,
+        coeff_link_col="reservoir_id",
         location_flag=1,
     )
 
@@ -204,12 +212,18 @@ def test_jinja_reservoir_file_uses_csv_coefficients(tmp_path):
 
 
 def test_jinja_reservoir_file_zeros_coefficients_for_flag_three(tmp_path):
-    cat = pd.DataFrame({"COMID": [101], "IREACH": [1]})
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "reservoir_id": ["R-101"],
+        }
+    )
     coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
     csv_path = tmp_path / "reservoirs.csv"
     csv_path.write_text(
-        "COMID,name,b1,b2\n"
-        "101,Ghost Lake,0.15,0.25\n"
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
     )
     coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
 
@@ -218,6 +232,7 @@ def test_jinja_reservoir_file_zeros_coefficients_for_flag_three(tmp_path):
         coords=coords,
         main_id="COMID",
         coefficients=coefficients,
+        coeff_link_col="reservoir_id",
         location_flag=0,
         use_power_coefficients=False,
     )
@@ -271,13 +286,14 @@ def test_jinja_reservoir_inflows_matches_example_layout(tmp_path):
             "COMID": [101],
             "IREACH": [1],
             "lake_area": [11600000.0],
+            "reservoir_id": ["R-101"],
         }
     )
     coords = pd.DataFrame({"COMID": [101], "lat": [51.21], "lon": [-114.7]})
     csv_path = tmp_path / "reservoirs.csv"
     csv_path.write_text(
-        "COMID,name,b1,b2\n"
-        "101,Ghost,3.5e-14,2.0\n"
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost,3.5e-14,2.0\n"
     )
     coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
 
@@ -286,6 +302,7 @@ def test_jinja_reservoir_inflows_matches_example_layout(tmp_path):
         coords=coords,
         main_id="COMID",
         coefficients=coefficients,
+        coeff_link_col="reservoir_id",
         lake_area_col="lake_area",
         subbasin_areas={101: 5000000.0},
     )
@@ -324,6 +341,7 @@ def test_jinja_reservoir_inflows_uses_single_column_metadata_block(tmp_path):
             "COMID": [101, 102],
             "IREACH": [1, 2],
             "lake_area": [11600000.0, 5000000.0],
+            "reservoir_id": ["R-101", "R-102"],
         }
     )
     coords = pd.DataFrame(
@@ -335,9 +353,9 @@ def test_jinja_reservoir_inflows_uses_single_column_metadata_block(tmp_path):
     )
     csv_path = tmp_path / "reservoirs.csv"
     csv_path.write_text(
-        "COMID,name,b1,b2\n"
-        "101,Ghost,3.5e-14,2.0\n"
-        "102,Lake2,1.0,1.0\n"
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost,3.5e-14,2.0\n"
+        "R-102,Lake2,1.0,1.0\n"
     )
     coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
 
@@ -346,6 +364,7 @@ def test_jinja_reservoir_inflows_uses_single_column_metadata_block(tmp_path):
         coords=coords,
         main_id="COMID",
         coefficients=coefficients,
+        coeff_link_col="reservoir_id",
         lake_area_col="lake_area",
         subbasin_areas={101: 5000000.0, 102: 4000000.0},
     )
@@ -382,3 +401,102 @@ def test_fortran_g10_3_uses_scientific_for_extreme_values():
     assert reservoir.fortran_g10_3(21568734) == "  2.16E+07"
     assert "E" in reservoir.fortran_g10_3(3.5e-14)
     assert "e" not in reservoir.fortran_g10_3(3.5e-14)
+
+
+def test_parse_reservoir_coefficient_link_defaults_to_reservoir_id():
+    assert parse_reservoir_coefficient_link({}, "COMID") == ("reservoir_id", None)
+    assert parse_reservoir_coefficient_link({"name_col": "name"}, "COMID") == (
+        "reservoir_id",
+        None,
+    )
+
+
+def test_parse_reservoir_coefficient_link_accepts_explicit_keys():
+    assert parse_reservoir_coefficient_link({"basin_id": "COMID"}, "COMID") == (
+        "basin_id",
+        "COMID",
+    )
+    assert parse_reservoir_coefficient_link(
+        {"reservoir_id": "res_id"}, "COMID"
+    ) == ("reservoir_id", "res_id")
+
+
+def test_read_reservoir_coefficients_defaults_to_reservoir_id(tmp_path):
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+
+    assert list(coefficients.columns) == ["reservoir_id", "b1", "b2", "name"]
+    assert coefficients.loc["R-101", "name"] == "Ghost Lake"
+
+
+def test_read_reservoir_coefficients_links_on_basin_id_when_explicit(tmp_path):
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "COMID,name,b1,b2\n"
+        "101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(
+        str(csv_path),
+        main_id="COMID",
+        link_key="basin_id",
+    )
+
+    assert list(coefficients.columns) == ["basin_id", "b1", "b2", "name"]
+    assert coefficients.loc[101, "name"] == "Ghost Lake"
+
+
+def test_read_reservoir_coefficients_links_on_reservoir_id(tmp_path):
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "res_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(
+        str(csv_path),
+        main_id="COMID",
+        link_key="reservoir_id",
+        id_col="res_id",
+    )
+
+    assert list(coefficients.columns) == ["reservoir_id", "b1", "b2", "name"]
+    assert coefficients.loc["R-101", "name"] == "Ghost Lake"
+
+
+def test_prepare_reservoir_context_links_coefficients_by_reservoir_id(tmp_path):
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "reservoir_id": ["R-101"],
+        }
+    )
+    coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "res_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(
+        str(csv_path),
+        main_id="COMID",
+        link_key="reservoir_id",
+        id_col="res_id",
+    )
+
+    context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        coeff_link_key="reservoir_id",
+        coeff_link_col="reservoir_id",
+        location_flag=1,
+    )
+
+    assert context["reservoirs"][0]["name"] == "Ghost Lake"
+    assert context["reservoirs"][0]["b1"] == 0.15
+    assert context["reservoirs"][0]["b2"] == 0.25

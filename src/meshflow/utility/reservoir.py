@@ -10,7 +10,15 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 import geopandas as gpd
 import pandas as pd
 
+RESERVOIR_LINK_KEYS = ("reservoir_id", "basin_id")
 RESERVOIR_ID_ALIASES = ("COMID", "comid", "main_id", "id", "basin_id")
+RESERVOIR_PARAM_ID_ALIASES = (
+    "reservoir_id",
+    "reservoirid",
+    "res_id",
+    "reservoir",
+    "id",
+)
 RESERVOIR_NAME_ALIASES = ("name", "reservoir_name", "res_name", "reservoir")
 RESERVOIR_B1_ALIASES = ("b1", "B1", "WF_B1", "wf_b1")
 RESERVOIR_B2_ALIASES = ("b2", "B2", "WF_B2", "wf_b2")
@@ -166,6 +174,56 @@ def format_reservoir_line(
     )
 
 
+def parse_reservoir_coefficient_link(
+    column_config: Optional[Mapping[str, Any]],
+    main_id: str,
+) -> tuple[str, Optional[str]]:
+    """
+    Resolve how reservoir coefficients are joined to catchments.
+
+    ``column_config`` may contain exactly one of:
+
+    - ``reservoir_id``: CSV column matched to ``ddb_vars['reservoir_id']``
+      (default when no link key is given)
+    - ``basin_id``: CSV column matched to the catchment ``main_id``
+
+    Legacy ``id_col`` entries imply ``basin_id`` linking.
+    """
+    if not column_config:
+        return "reservoir_id", None
+
+    found: List[tuple[str, str]] = []
+    for link_key in RESERVOIR_LINK_KEYS:
+        if link_key in column_config:
+            value = column_config[link_key]
+            if value in (None, ""):
+                raise ValueError(
+                    f"`{link_key}` in `reservoir_coefficient_columns` must be "
+                    "a parameter-file column name."
+                )
+            found.append((link_key, str(value)))
+
+    if len(found) > 1:
+        keys = [key for key, _ in found]
+        raise ValueError(
+            "Specify only one reservoir coefficient link key in "
+            f"`reservoir_coefficient_columns`; got {keys}."
+        )
+    if found:
+        return found[0]
+
+    if "id_col" in column_config:
+        value = column_config["id_col"]
+        if value in (None, ""):
+            raise ValueError(
+                "`id_col` in `reservoir_coefficient_columns` must be a "
+                "parameter-file column name."
+            )
+        return "basin_id", str(value)
+
+    return "reservoir_id", None
+
+
 def _resolve_column(
     columns: Sequence[str],
     aliases: Sequence[str],
@@ -188,6 +246,7 @@ def _resolve_column(
 def read_reservoir_coefficients(
     csv_path: str,
     main_id: str,
+    link_key: str = "reservoir_id",
     id_col: Optional[str] = None,
     name_col: Optional[str] = None,
     b1_col: Optional[str] = None,
@@ -202,21 +261,32 @@ def read_reservoir_coefficients(
         Path to the coefficient CSV file.
     main_id : str
         Name of the basin ID column on the catchment data (e.g. ``COMID``).
+    link_key : str, optional
+        Join field for coefficient lookup: ``reservoir_id`` (default) or
+        ``basin_id``.
     id_col, name_col, b1_col, b2_col : str, optional
         Explicit column names. When omitted, common aliases are detected.
     """
+    if link_key not in RESERVOIR_LINK_KEYS:
+        raise ValueError(
+            f"`link_key` must be one of {RESERVOIR_LINK_KEYS}; got `{link_key}`."
+        )
+
     coeff_df = pd.read_csv(csv_path)
     columns = list(coeff_df.columns)
 
-    resolved_id = _resolve_column(
-        columns,
-        (main_id, *RESERVOIR_ID_ALIASES),
-        explicit=id_col,
-    )
+    if link_key == "basin_id":
+        id_aliases = (main_id, *RESERVOIR_ID_ALIASES)
+        id_label = "basin ID"
+    else:
+        id_aliases = RESERVOIR_PARAM_ID_ALIASES
+        id_label = "reservoir ID"
+
+    resolved_id = _resolve_column(columns, id_aliases, explicit=id_col)
     if resolved_id is None:
         raise ValueError(
-            f"Could not find a basin ID column in `{csv_path}`. "
-            f"Expected one of {(main_id, *RESERVOIR_ID_ALIASES)}."
+            f"Could not find a {id_label} column in `{csv_path}`. "
+            f"Expected one of {id_aliases}."
         )
 
     resolved_name = _resolve_column(columns, RESERVOIR_NAME_ALIASES, explicit=name_col)
@@ -230,14 +300,14 @@ def read_reservoir_coefficients(
         )
 
     out = coeff_df[[resolved_id, resolved_b1, resolved_b2]].copy()
-    out.columns = ["basin_id", "b1", "b2"]
+    out.columns = [link_key, "b1", "b2"]
     if resolved_name is not None:
         out["name"] = coeff_df[resolved_name]
     else:
         out["name"] = pd.NA
 
-    out = out.drop_duplicates(subset=["basin_id"], keep="first")
-    return out.set_index("basin_id", drop=False)
+    out = out.drop_duplicates(subset=[link_key], keep="first")
+    return out.set_index(link_key, drop=False)
 
 
 def _resolve_reach_area(
@@ -295,6 +365,8 @@ def prepare_reservoir_context(
     use_power_coefficients: bool = True,
     lake_area_col: Optional[str] = None,
     subbasin_areas: Optional[Mapping[Any, Any]] = None,
+    coeff_link_key: str = "reservoir_id",
+    coeff_link_col: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build the Jinja context for reservoir input files.
@@ -316,8 +388,15 @@ def prepare_reservoir_context(
         Lake numbering column written by ``_compute_ireach`` (default
         ``IREACH``).
     coefficients : pandas.DataFrame, optional
-        Coefficient table indexed by basin ID. When a lake is missing from
-        this table, ``WF_B1`` and ``WF_B2`` are set to zero.
+        Coefficient table indexed by ``coeff_link_key``. When a lake is
+        missing from this table, ``WF_B1`` and ``WF_B2`` are set to zero.
+    coeff_link_key : str, optional
+        Catchment field used to join coefficients: ``reservoir_id`` (default)
+        or ``basin_id``. Only used when ``coefficients`` is provided.
+    coeff_link_col : str, optional
+        Catchment column for coefficient lookup. Defaults to ``reservoir_id``
+        or the ``ddb_vars['reservoir_id']`` mapping for ``reservoir_id``
+        linking, and ``main_id`` for ``basin_id`` linking.
     location_flag : int, optional
         MESH ``LOCATIONFLAG`` value. ``0`` writes integer ``i5`` locations;
         ``1`` writes real ``f7.1`` locations.
@@ -340,6 +419,22 @@ def prepare_reservoir_context(
     """
     if location_flag not in (0, 1):
         raise ValueError("`location_flag` must be 0 or 1.")
+    if coeff_link_key not in RESERVOIR_LINK_KEYS:
+        raise ValueError(
+            f"`coeff_link_key` must be one of {RESERVOIR_LINK_KEYS}; "
+            f"got `{coeff_link_key}`."
+        )
+    needs_coeff_link = coefficients is not None
+    if needs_coeff_link:
+        if coeff_link_col is None:
+            coeff_link_col = (
+                main_id if coeff_link_key == "basin_id" else "reservoir_id"
+            )
+        if coeff_link_col not in cat.columns:
+            raise ValueError(
+                f"Coefficient link column `{coeff_link_col}` not found in "
+                f"catchment data. Available columns: {list(cat.columns)}"
+            )
     if lake_col not in cat.columns:
         raise ValueError(
             f"Lake column `{lake_col}` not found in catchment data. "
@@ -352,6 +447,8 @@ def prepare_reservoir_context(
         )
 
     lake_columns = [main_id, lake_col]
+    if needs_coeff_link and coeff_link_col not in lake_columns:
+        lake_columns.append(coeff_link_col)
     if lake_area_col is not None:
         lake_columns.append(lake_area_col)
 
@@ -364,7 +461,9 @@ def prepare_reservoir_context(
 
     coeff_lookup: Dict[Any, Dict[str, Any]] = {}
     if coefficients is not None:
-        coeff_lookup = coefficients.set_index("basin_id", drop=False).to_dict("index")
+        coeff_lookup = coefficients.set_index(coeff_link_key, drop=False).to_dict(
+            "index"
+        )
 
     area_lookup: Dict[Any, Any] = {}
     if subbasin_areas is not None:
@@ -388,6 +487,15 @@ def prepare_reservoir_context(
     reservoirs: List[Dict[str, Any]] = []
     for row in lakes.itertuples(index=False):
         basin_id = getattr(row, main_id)
+        if needs_coeff_link:
+            coeff_lookup_id = getattr(row, coeff_link_col)
+            coeff = _lookup_coefficient(coeff_lookup, coeff_lookup_id)
+            default_name = default_reservoir_name(
+                coeff_lookup_id if coeff_link_key == "reservoir_id" else basin_id
+            )
+        else:
+            coeff = None
+            default_name = default_reservoir_name(basin_id)
         ireach_num = int(getattr(row, lake_col))
         lat_deg = float(getattr(row, "lat"))
         lon_deg = float(getattr(row, "lon"))
@@ -405,29 +513,27 @@ def prepare_reservoir_context(
                 subbasin_area=_lookup_mapping_value(area_lookup, basin_id),
                 basin_id=basin_id,
             )
-
-        coeff = _lookup_coefficient(coeff_lookup, basin_id)
         if not use_power_coefficients:
             b1 = 0.0
             b2 = 0.0
             if coeff is None:
-                name = default_reservoir_name(basin_id)
+                name = default_name
             else:
                 raw_name = coeff.get("name", pd.NA)
                 if pd.isna(raw_name) or str(raw_name).strip() == "":
-                    name = default_reservoir_name(basin_id)
+                    name = default_name
                 else:
                     name = str(raw_name)
         elif coeff is None:
             b1 = 0.0
             b2 = 0.0
-            name = default_reservoir_name(basin_id)
+            name = default_name
         else:
             b1 = float(coeff.get("b1", 0.0) or 0.0)
             b2 = float(coeff.get("b2", 0.0) or 0.0)
             raw_name = coeff.get("name", pd.NA)
             if pd.isna(raw_name) or str(raw_name).strip() == "":
-                name = default_reservoir_name(basin_id)
+                name = default_name
             else:
                 name = str(raw_name)
 
