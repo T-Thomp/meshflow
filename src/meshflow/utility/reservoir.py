@@ -4,6 +4,7 @@ Utilities for preparing MESH_input_reservoir.txt context data.
 
 from __future__ import annotations
 
+import os
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
@@ -90,6 +91,84 @@ def tb0_location(value: float) -> str:
 def tb0_reach_area(value: float) -> str:
     """Format a reach area in square metres for ``MESH_input_reservoir.tb0``."""
     return str(int(round(float(value))))
+
+
+def format_tb0_column_lines(column_rows: Sequence[Sequence[str]]) -> List[str]:
+    """
+    Left-align column values to even widths with at least one space between.
+
+    Each column's width is the widest value in that column across all rows.
+    Values are left-aligned within their column width and joined with a
+    single space so columns stay vertically aligned.
+    """
+    if not column_rows:
+        return []
+
+    n_cols = len(column_rows[0])
+    if any(len(row) != n_cols for row in column_rows):
+        raise ValueError("All tb0 column metadata rows must have the same length.")
+
+    widths = [
+        max((len(row[i]) for row in column_rows), default=0)
+        for i in range(n_cols)
+    ]
+    return [
+        " ".join(value.ljust(widths[i]) for i, value in enumerate(row)).rstrip()
+        for row in column_rows
+    ]
+
+
+def build_tb0_column_metadata(
+    reservoirs: Sequence[Mapping[str, Any]],
+) -> Dict[str, str]:
+    """Build left-aligned ``:ColumnMetaData`` value lines for the tb0 file."""
+    if not reservoirs:
+        return {
+            "column_type": "",
+            "column_units": "",
+            "column_name": "",
+            "column_model": "",
+            "column_location_x": "",
+            "column_location_y": "",
+            "coeff1": "",
+            "coeff2": "",
+            "reach_area": "",
+        }
+
+    rows = [
+        ["float"] * len(reservoirs),
+        ["m3/s"] * len(reservoirs),
+        [mesh_reservoir_name(reservoir["name"]) for reservoir in reservoirs],
+        ["LAKE"] * len(reservoirs),
+        [tb0_location(reservoir["lon"]) for reservoir in reservoirs],
+        [tb0_location(reservoir["lat"]) for reservoir in reservoirs],
+        [tb0_coeff(reservoir["b1"]) for reservoir in reservoirs],
+        [tb0_coeff(reservoir["b2"]) for reservoir in reservoirs],
+        [tb0_reach_area(reservoir["reach_area"]) for reservoir in reservoirs],
+    ]
+    (
+        column_type,
+        column_units,
+        column_name,
+        column_model,
+        column_location_x,
+        column_location_y,
+        coeff1,
+        coeff2,
+        reach_area,
+    ) = format_tb0_column_lines(rows)
+
+    return {
+        "column_type": column_type,
+        "column_units": column_units,
+        "column_name": column_name,
+        "column_model": column_model,
+        "column_location_x": column_location_x,
+        "column_location_y": column_location_y,
+        "coeff1": coeff1,
+        "coeff2": coeff2,
+        "reach_area": reach_area,
+    }
 
 
 def mesh_timestep_delta_t_hours(timestep_minutes: float) -> str:
@@ -586,4 +665,43 @@ def prepare_reservoir_inflows_context(
         "meshflow_version": meshflow_version,
         "creation_date": creation_date or date.today().isoformat(),
         "tb0_banner": TB0_FILE_BANNER,
+        "tb0_columns": build_tb0_column_metadata(
+            reservoir_context.get("reservoirs", [])
+        ),
     }
+
+
+def write_reservoir_output_files(
+    output_dir: str,
+    reservoir_text: Optional[str] = None,
+    reservoir_inflows_text: Optional[str] = None,
+    blank_stub: Optional[str] = None,
+) -> None:
+    """
+    Write the active reservoir input file and remove the unused format.
+
+    Prefer ``reservoir_inflows_text`` (``.tb0``) when set, otherwise
+    ``reservoir_text`` (``.txt``). If neither is provided, write
+    ``blank_stub`` as ``MESH_input_reservoir.txt``.
+    """
+    reservoir_txt_path = os.path.join(output_dir, "MESH_input_reservoir.txt")
+    reservoir_tb0_path = os.path.join(output_dir, "MESH_input_reservoir.tb0")
+
+    if reservoir_inflows_text:
+        with open(reservoir_tb0_path, "w") as handle:
+            handle.write(reservoir_inflows_text)
+        if os.path.isfile(reservoir_txt_path):
+            os.remove(reservoir_txt_path)
+        return
+
+    content = reservoir_text if reservoir_text is not None else blank_stub
+    if content is None:
+        raise ValueError(
+            "Provide reservoir_text, reservoir_inflows_text, or blank_stub."
+        )
+
+    with open(reservoir_txt_path, "w") as handle:
+        handle.write(content)
+    if os.path.isfile(reservoir_tb0_path):
+        os.remove(reservoir_tb0_path)
+

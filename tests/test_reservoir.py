@@ -108,6 +108,35 @@ def test_reservoir_header_matches_dummy_file():
     assert format_reservoir_header(3) == "    3     0     0"
 
 
+def test_blank_reservoir_template_replaces_default_settings_file():
+    """Blank stub comes from Jinja, not default_settings/MESH_input_reservoir.txt."""
+    from jinja2 import Environment, FileSystemLoader
+
+    env = Environment(
+        loader=FileSystemLoader(TEMPLATES),
+        trim_blocks=True,
+        lstrip_blocks=True,
+        line_comment_prefix="##",
+    )
+    env.filters["fortran_i5"] = reservoir.fortran_i5
+    env.filters["fortran_f7_1"] = reservoir.fortran_f7_1
+    env.filters["fortran_g10_3"] = reservoir.fortran_g10_3
+    env.filters["fortran_a12"] = reservoir.fortran_a12
+    env.filters["fortran_i2"] = reservoir.fortran_i2
+    env.filters["mesh_reservoir_name"] = reservoir.mesh_reservoir_name
+
+    content = env.get_template("MESH_input_reservoir.txt.jinja").render(
+        n_reservoirs=0,
+        location_flag=0,
+        reservoirs=[],
+    )
+    if not content.endswith("\n"):
+        content += "\n"
+
+    assert content.startswith("    0     0     0\n")
+    assert content.rstrip("\n") == "    0     0     0"
+
+
 def test_format_reservoir_line_locationflag_zero():
     line = format_reservoir_line(
         lat_min=3066.0,
@@ -324,11 +353,11 @@ def test_jinja_reservoir_inflows_matches_example_layout(tmp_path):
     assert ":RoutingDeltaT" not in text
     assert ":FillFlag" not in text
     assert text.splitlines()[0] == "########################################"
-    assert "   :ColumnName            Ghost" in text
-    assert "   :ColumnLocationX      -114.7" in text
-    assert "   :ColumnLocationY       51.21" in text
+    assert "   :ColumnName         Ghost" in text
+    assert "   :ColumnLocationX    -114.7" in text
+    assert "   :ColumnLocationY    51.21" in text
     assert "   :Coeff1             3.50E-14" in text
-    assert "   :Coeff2              2.0E+00" in text
+    assert "   :Coeff2             2.0E+00" in text
     assert "   :ReachArea          11600000" in text
     assert text.count(":ColumnMetaData") == 1
     assert text.count(":EndColumnMetaData") == 1
@@ -378,12 +407,30 @@ def test_jinja_reservoir_inflows_uses_single_column_metadata_block(tmp_path):
 
     assert text.count(":ColumnMetaData") == 1
     assert text.count(":EndColumnMetaData") == 1
-    assert "   :ColumnName            Ghost Lake2" in text
-    assert "   :ColumnLocationX      -114.7 -115" in text
-    assert "   :ColumnLocationY       51.21 51.3" in text
+    assert "   :ColumnName         Ghost    Lake2" in text
+    assert "   :ColumnLocationX    -114.7   -115" in text
+    assert "   :ColumnLocationY    51.21    51.3" in text
     assert "   :Coeff1             3.50E-14 1.0E+00" in text
-    assert "   :Coeff2              2.0E+00 1.0E+00" in text
+    assert "   :Coeff2             2.0E+00  1.0E+00" in text
     assert "   :ReachArea          11600000 5000000" in text
+
+
+def test_format_tb0_column_lines_left_aligns_to_widest_per_column():
+    lines = reservoir.format_tb0_column_lines(
+        [
+            ["a", "bb"],
+            ["ccc", "d"],
+            ["ee", "fffff"],
+        ]
+    )
+    assert lines == [
+        "a   bb",
+        "ccc d",
+        "ee  fffff",
+    ]
+    # At least one space between columns, even when a value fills its width.
+    assert "ccc d" == lines[1]
+    assert lines[0].index("bb") == lines[2].index("f")
 
 
 def test_tb0_coeff_matches_mesh_example_format():
@@ -500,3 +547,39 @@ def test_prepare_reservoir_context_links_coefficients_by_reservoir_id(tmp_path):
     assert context["reservoirs"][0]["name"] == "Ghost Lake"
     assert context["reservoirs"][0]["b1"] == 0.15
     assert context["reservoirs"][0]["b2"] == 0.25
+
+
+def test_write_reservoir_files_tb0_does_not_leave_blank_txt(tmp_path):
+    blank = tmp_path / "MESH_input_reservoir.txt"
+    blank.write_text("    0     0     0\n")
+
+    reservoir.write_reservoir_output_files(
+        str(tmp_path),
+        reservoir_inflows_text=":FileType tb0  ASCII\n:endHeader\n",
+    )
+
+    assert (tmp_path / "MESH_input_reservoir.tb0").read_text().startswith(":FileType tb0")
+    assert not blank.exists()
+
+
+def test_write_reservoir_files_txt_removes_stale_tb0(tmp_path):
+    stale = tmp_path / "MESH_input_reservoir.tb0"
+    stale.write_text(":FileType tb0  ASCII\n")
+
+    reservoir.write_reservoir_output_files(
+        str(tmp_path),
+        reservoir_text="    1     0     0\n",
+    )
+
+    assert (tmp_path / "MESH_input_reservoir.txt").read_text().startswith("    1")
+    assert not stale.exists()
+
+
+def test_write_reservoir_files_blank_stub_when_disabled(tmp_path):
+    reservoir.write_reservoir_output_files(
+        str(tmp_path),
+        blank_stub="    0     0     0\n",
+    )
+
+    assert (tmp_path / "MESH_input_reservoir.txt").read_text().startswith("    0")
+    assert not (tmp_path / "MESH_input_reservoir.tb0").exists()

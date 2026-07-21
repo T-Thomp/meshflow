@@ -686,14 +686,16 @@ Output files
 ~~~~~~~~~~~~
 
 - ``MESH_input_reservoir.txt``: Fortran-style reservoir input used by
-  Standalone MESH. Written when ``RESERVOIRFILEFLAG`` is ``txt`` (default).
+  Standalone MESH. Written when reservoirs are enabled and
+  ``RESERVOIRFILEFLAG`` is ``txt`` (default). When reservoirs are disabled
+  (``RESERVOIRFLAG`` missing or ``0``), a blank ``0 0 0`` stub is written
+  instead.
 
-- ``MESH_input_reservoir.tb0``: Time-series basin file header with lake
+- ``MESH_input_reservoir.tb0``: Reservoir input file with lake
   metadata (names, locations, coefficients, reach areas). Written when
-  ``RESERVOIRFILEFLAG`` is ``tb0``.
+  reservoirs are enabled and ``RESERVOIRFILEFLAG`` is ``tb0``. The blank
+  ``.txt`` stub is not written in this case.
 
-Both files list the same lakes in ``IREACH`` order. The ``.tb0`` format is
-typically used when reservoir inflows are supplied as time series.
 
 Run flags
 ~~~~~~~~~
@@ -716,7 +718,8 @@ example uses the ``etc`` flag group:
 
 - ``RESERVOIRFLAG``: ``1`` reads power-curve coefficients from the parameter
   file; ``3`` writes the same reservoir file but sets ``WF_B1`` and ``WF_B2``
-  to zero. Omit or disable when no lakes are simulated.
+  to zero. Omit or set to ``0`` when no lakes are simulated (writes a blank
+  ``MESH_input_reservoir.txt`` stub).
 
 - ``RESERVOIRFILEFLAG``: ``txt`` (default) or ``tb0``.
 

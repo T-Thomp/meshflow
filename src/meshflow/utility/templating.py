@@ -566,6 +566,22 @@ def render_reservoir_template(
     return content + '\n'
 
 
+def render_blank_reservoir_template(location_flag: int = 0) -> str:
+    """
+    Render the blank ``MESH_input_reservoir.txt`` stub (``0 0 0`` header).
+
+    Used when reservoirs are disabled (``RESERVOIRFLAG`` missing or ``0``)
+    instead of copying a static default file.
+    """
+    return render_reservoir_template(
+        {
+            "n_reservoirs": 0,
+            "location_flag": int(location_flag),
+            "reservoirs": [],
+        }
+    )
+
+
 def render_reservoir_inflows_template(
     inflows_dict: Dict[str, Any],
     template_inflows_path: PathLike = TEMPLATE_RESERVOIR_TB0, # type: ignore

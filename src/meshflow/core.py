@@ -1055,16 +1055,20 @@ class MESHWorkflow(object):
         """
         Build reservoir input files for lakes and reservoirs.
 
-        Writes ``MESH_input_reservoir.txt`` by default, or
-        ``MESH_input_reservoir.tb0`` when ``RESERVOIRFILEFLAG`` is ``tb0``,
-        when ``RESERVOIRFLAG`` is ``1`` or ``3`` in
-        ``settings['run_options']['flags']`` and ``ireach`` is included in
-        ``ddb_vars``.         With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve
-        coefficients are optionally read from
-        ``settings['core']['reservoir_coefficients']``. Coefficients can be
-        joined on a ``reservoir_id`` column mapped through ``ddb_vars``
-        (default), or on the catchment ``main_id`` when ``basin_id`` is
-        specified in ``reservoir_coefficient_columns``. With
+        When ``RESERVOIRFLAG`` is missing or ``0``, or ``ireach`` is not mapped
+        in ``ddb_vars``, stores a blank ``MESH_input_reservoir.txt`` stub
+        (``0 0 0`` header only).
+
+        When ``RESERVOIRFLAG`` is ``1`` or ``3`` and ``ireach`` is mapped,
+        writes the formatted reservoir file: ``MESH_input_reservoir.txt`` by
+        default, or ``MESH_input_reservoir.tb0`` when ``RESERVOIRFILEFLAG`` is
+        ``tb0``. Only one of these files is produced — not both.
+
+        With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve coefficients are
+        optionally read from ``settings['core']['reservoir_coefficients']``.
+        Coefficients can be joined on a ``reservoir_id`` column mapped through
+        ``ddb_vars`` (default), or on the catchment ``main_id`` when
+        ``basin_id`` is specified in ``reservoir_coefficient_columns``. With
         ``RESERVOIRFLAG`` ``3``, the same file is written but ``WF_B1`` and
         ``WF_B2`` are always zero.
 
@@ -1087,20 +1091,11 @@ class MESHWorkflow(object):
         """
         self.reservoir_file_format = self._reservoir_file_format()
 
-        if "ireach" not in self.ddb_vars:
-            self.reservoir_text = None
+        # No lakes mapped, or RESERVOIRFLAG missing/0: write the blank stub.
+        if "ireach" not in self.ddb_vars or not self._reservoir_flag_enabled():
+            dummy = utility.render_blank_reservoir_template(self._location_flag())
+            self.reservoir_text = dummy
             self.reservoir_inflows_text = None
-            dummy = utility.render_reservoir_template(
-                {"n_reservoirs": 0, "location_flag": self._location_flag(), "reservoirs": []}
-            )
-            return dummy if return_text else None
-
-        if not self._reservoir_flag_enabled():
-            self.reservoir_text = None
-            self.reservoir_inflows_text = None
-            dummy = utility.render_reservoir_template(
-                {"n_reservoirs": 0, "location_flag": self._location_flag(), "reservoirs": []}
-            )
             return dummy if return_text else None
 
         if "IREACH" not in self.cat.columns:
@@ -2376,22 +2371,7 @@ class MESHWorkflow(object):
             if os.path.isfile(f):
                 shutil.copy2(f, output_dir)
 
-        if getattr(self, 'reservoir_text', None) is None:
-            if (
-                "ireach" in self.ddb_vars
-                and "IREACH" in getattr(self, "cat", pd.DataFrame()).columns
-            ):
-                self.init_reservoir()
-
-        if getattr(self, 'reservoir_text', None):
-            reservoir_file = 'MESH_input_reservoir.txt'
-            with open(os.path.join(output_dir, reservoir_file), 'w') as f:
-                f.write(self.reservoir_text)
-
-        if getattr(self, 'reservoir_inflows_text', None):
-            reservoir_inflows_file = 'MESH_input_reservoir.tb0'
-            with open(os.path.join(output_dir, reservoir_inflows_file), 'w') as f:
-                f.write(self.reservoir_inflows_text)
+        self._write_reservoir_files(output_dir)
 
         # save the class text file
         class_file = 'MESH_parameters_CLASS.ini'
@@ -2414,6 +2394,27 @@ class MESHWorkflow(object):
             self.parameters_ds.to_netcdf(os.path.join(output_dir, parameters_file))
 
         return
+
+    def _write_reservoir_files(self, output_dir: str) -> None:
+        """
+        Write the active reservoir input file and remove the unused format.
+
+        ``RESERVOIRFLAG`` missing/``0`` → blank ``MESH_input_reservoir.txt``.
+        Enabled + ``txt`` → formatted ``.txt`` only.
+        Enabled + ``tb0`` → formatted ``.tb0`` only (no blank ``.txt``).
+        """
+        if (
+            getattr(self, 'reservoir_text', None) is None
+            and getattr(self, 'reservoir_inflows_text', None) is None
+        ):
+            self.init_reservoir()
+
+        utility.write_reservoir_output_files(
+            output_dir,
+            reservoir_text=getattr(self, 'reservoir_text', None),
+            reservoir_inflows_text=getattr(self, 'reservoir_inflows_text', None),
+            blank_stub=utility.render_blank_reservoir_template(self._location_flag()),
+        )
 
     def _init_idx_vars(self):
         """
