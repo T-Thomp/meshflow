@@ -30,6 +30,24 @@ RESERVOIR_NAME_GAP = 25
 TB0_FILE_BANNER = "########################################"
 
 
+def _expand_grouped_keys(mapping: Mapping[Any, Any]) -> Dict[Any, Any]:
+    """Expand grouped dict keys; works when this module is loaded standalone."""
+    try:
+        from .utils import expand_grouped_keys
+    except ImportError:  # pragma: no cover - unit-test standalone load
+        import importlib.util
+
+        utils_path = os.path.join(os.path.dirname(__file__), "utils.py")
+        spec = importlib.util.spec_from_file_location(
+            "_meshflow_utils_for_reservoir", utils_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        expand_grouped_keys = module.expand_grouped_keys
+    return expand_grouped_keys(dict(mapping))
+
+
 def degrees_to_mesh_minutes(degrees: float) -> float:
     """Convert decimal degrees to MESH north-south/east-west minutes."""
     return float(degrees) * 60.0
@@ -387,6 +405,224 @@ def read_reservoir_coefficients(
 
     out = out.drop_duplicates(subset=[link_key], keep="first")
     return out.set_index(link_key, drop=False)
+
+
+def _resolve_param_value(
+    entry: Mapping[str, Any],
+    aliases: Sequence[str],
+    default: Any = None,
+) -> Any:
+    """Return the first matching alias value from a parameter entry."""
+    lower_map = {str(key).lower(): value for key, value in entry.items()}
+    for alias in aliases:
+        if alias in entry:
+            return entry[alias]
+        lowered = alias.lower()
+        if lowered in lower_map:
+            return lower_map[lowered]
+    return default
+
+
+def normalize_reservoir_param_entry(
+    entry: Optional[Mapping[str, Any]] = None,
+    *,
+    fill_missing: bool = True,
+) -> Dict[str, Any]:
+    """
+    Normalize a reservoir parameter entry to ``b1``, ``b2``, and optional
+    ``name``.
+
+    Accepts common aliases such as ``B1`` / ``WF_B1`` and ``B2`` / ``WF_B2``.
+    When ``fill_missing`` is True (default), missing coefficients default to
+    ``0.0``. When False, only explicitly provided fields are returned so
+    partial overlays can update a single coefficient during calibration.
+    """
+    if entry is None:
+        entry = {}
+    if not isinstance(entry, Mapping):
+        raise ValueError("Reservoir parameter entries must be dictionaries.")
+
+    lower_keys = {str(key).lower() for key in entry.keys()}
+    has_b1 = any(alias.lower() in lower_keys or alias in entry for alias in RESERVOIR_B1_ALIASES)
+    has_b2 = any(alias.lower() in lower_keys or alias in entry for alias in RESERVOIR_B2_ALIASES)
+    has_name = any(alias.lower() in lower_keys or alias in entry for alias in RESERVOIR_NAME_ALIASES)
+
+    normalized: Dict[str, Any] = {}
+
+    if has_b1 or fill_missing:
+        raw_b1 = _resolve_param_value(entry, RESERVOIR_B1_ALIASES, default=0.0)
+        if raw_b1 is None or (isinstance(raw_b1, float) and pd.isna(raw_b1)):
+            raw_b1 = 0.0
+        normalized["b1"] = float(raw_b1)
+
+    if has_b2 or fill_missing:
+        raw_b2 = _resolve_param_value(entry, RESERVOIR_B2_ALIASES, default=0.0)
+        if raw_b2 is None or (isinstance(raw_b2, float) and pd.isna(raw_b2)):
+            raw_b2 = 0.0
+        normalized["b2"] = float(raw_b2)
+
+    if has_name:
+        raw_name = _resolve_param_value(entry, RESERVOIR_NAME_ALIASES, default=None)
+        if raw_name is not None and not (isinstance(raw_name, float) and pd.isna(raw_name)):
+            name = str(raw_name).strip()
+            if name:
+                normalized["name"] = name
+
+    return normalized
+
+
+def coefficients_to_reservoir_params(
+    coefficients: pd.DataFrame,
+    link_key: str = "reservoir_id",
+) -> Dict[Any, Dict[str, Any]]:
+    """Convert a coefficient DataFrame into a calibratable parameter dict."""
+    if link_key not in RESERVOIR_LINK_KEYS:
+        raise ValueError(
+            f"`link_key` must be one of {RESERVOIR_LINK_KEYS}; got `{link_key}`."
+        )
+    if coefficients is None or coefficients.empty:
+        return {}
+    if link_key not in coefficients.columns:
+        raise ValueError(
+            f"Coefficient table is missing link column `{link_key}`."
+        )
+
+    params: Dict[Any, Dict[str, Any]] = {}
+    for _, row in coefficients.drop_duplicates(subset=[link_key], keep="first").iterrows():
+        link_id = row[link_key]
+        entry = {
+            "b1": row["b1"] if "b1" in row.index else 0.0,
+            "b2": row["b2"] if "b2" in row.index else 0.0,
+        }
+        if "name" in row.index and not pd.isna(row["name"]):
+            entry["name"] = row["name"]
+        params[link_id] = normalize_reservoir_param_entry(entry)
+    return params
+
+
+def reservoir_params_to_coefficients(
+    reservoirs: Mapping[Any, Any],
+    link_key: str = "reservoir_id",
+) -> pd.DataFrame:
+    """
+    Convert a calibratable reservoir parameter dict to a coefficient
+    DataFrame accepted by :func:`prepare_reservoir_context`.
+    """
+    if link_key not in RESERVOIR_LINK_KEYS:
+        raise ValueError(
+            f"`link_key` must be one of {RESERVOIR_LINK_KEYS}; got `{link_key}`."
+        )
+
+    expanded = _expand_grouped_keys(reservoirs) if reservoirs else {}
+    rows: List[Dict[str, Any]] = []
+    for link_id, entry in expanded.items():
+        normalized = normalize_reservoir_param_entry(
+            entry if isinstance(entry, Mapping) else {}
+        )
+        row: Dict[str, Any] = {
+            link_key: link_id,
+            "b1": normalized["b1"],
+            "b2": normalized["b2"],
+            "name": normalized.get("name", pd.NA),
+        }
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=[link_key, "b1", "b2", "name"]).set_index(
+            link_key, drop=False
+        )
+
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=[link_key], keep="first")
+    return out.set_index(link_key, drop=False)
+
+
+def merge_reservoir_params(
+    base: Optional[Mapping[Any, Any]] = None,
+    overlay: Optional[Mapping[Any, Any]] = None,
+) -> Dict[Any, Dict[str, Any]]:
+    """
+    Merge reservoir parameter dictionaries.
+
+    ``overlay`` values replace matching keys in ``base`` (string/int soft
+    match). Grouped keys are expanded like CLASS ``grus``. Partial overlay
+    entries only update the fields they provide.
+    """
+    merged: Dict[Any, Dict[str, Any]] = {}
+    for link_id, entry in _expand_grouped_keys(base or {}).items():
+        merged[link_id] = normalize_reservoir_param_entry(
+            entry if isinstance(entry, Mapping) else {}
+        )
+
+    for link_id, entry in _expand_grouped_keys(overlay or {}).items():
+        normalized = normalize_reservoir_param_entry(
+            entry if isinstance(entry, Mapping) else {},
+            fill_missing=False,
+        )
+        existing_key = None
+        if link_id in merged:
+            existing_key = link_id
+        else:
+            for key in merged:
+                if str(key) == str(link_id):
+                    existing_key = key
+                    break
+        if existing_key is None:
+            merged[link_id] = normalize_reservoir_param_entry(normalized)
+        else:
+            merged[existing_key] = {**merged[existing_key], **normalized}
+    return merged
+
+
+def seed_reservoir_params_from_catchments(
+    cat: gpd.GeoDataFrame,
+    main_id: str,
+    lake_col: str = "IREACH",
+    coeff_link_key: str = "reservoir_id",
+    coeff_link_col: Optional[str] = None,
+) -> Dict[Any, Dict[str, Any]]:
+    """
+    Seed zero-coefficient entries for every lake catchment.
+
+    Keys use ``coeff_link_col`` when linking on ``reservoir_id``, otherwise
+    ``main_id`` when linking on ``basin_id``.
+    """
+    if coeff_link_key not in RESERVOIR_LINK_KEYS:
+        raise ValueError(
+            f"`coeff_link_key` must be one of {RESERVOIR_LINK_KEYS}; "
+            f"got `{coeff_link_key}`."
+        )
+    if lake_col not in cat.columns:
+        raise ValueError(
+            f"Lake column `{lake_col}` not found in catchment data. "
+            f"Available columns: {list(cat.columns)}"
+        )
+
+    if coeff_link_col is None:
+        coeff_link_col = main_id if coeff_link_key == "basin_id" else "reservoir_id"
+    if coeff_link_col not in cat.columns:
+        raise ValueError(
+            f"Coefficient link column `{coeff_link_col}` not found in "
+            f"catchment data. Available columns: {list(cat.columns)}"
+        )
+
+    lakes = (
+        cat.loc[cat[lake_col] > 0, [main_id, coeff_link_col]]
+        .drop_duplicates(subset=[main_id])
+    )
+    params: Dict[Any, Dict[str, Any]] = {}
+    for row in lakes.itertuples(index=False):
+        basin_id = getattr(row, main_id)
+        link_id = getattr(row, coeff_link_col)
+        default_name = default_reservoir_name(
+            link_id if coeff_link_key == "reservoir_id" else basin_id
+        )
+        params[link_id] = {
+            "b1": 0.0,
+            "b2": 0.0,
+            "name": default_name,
+        }
+    return params
 
 
 def _resolve_reach_area(

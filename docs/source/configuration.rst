@@ -583,8 +583,9 @@ Example structure:
    }
 
 The ``core`` section may also include ``reservoir_coefficients`` and
-``reservoir_coefficient_columns`` when lakes are enabled. See
-:ref:`reservoir-settings`.
+``reservoir_coefficient_columns`` when lakes are enabled. Calibratable
+coefficients live under the top-level ``reservoir_params`` key (parallel to
+``class_params``). See :ref:`reservoir-settings`.
 
 Therefore, the ``settings`` parameter consists of the following sections:
 
@@ -674,13 +675,15 @@ Reservoir support requires:
 1. A lake flag on the catchment shapefile, mapped with ``ddb_vars['ireach']``.
 2. ``RESERVOIRFLAG`` set to ``1`` or ``3`` in ``run_options`` (see
    :ref:`run-options-reservoir`).
-3. Optionally, a coefficient CSV and matching IDs on the catchment
-   shapefile.
+3. Optionally, initial power-curve coefficients from a CSV and/or a
+   ``reservoir_params`` dictionary (same role as ``class_params`` for CLASS).
 
 ``MESHFlow`` identifies lakes from the catchment data, assigns ``IREACH``
 numbers in downstream order, and writes reservoir locations from catchment
-centroids. Power-curve coefficients ``WF_B1`` and ``WF_B2`` are read from a
-parameter file when ``RESERVOIRFLAG`` is ``1``.
+centroids. Power-curve coefficients ``WF_B1`` and ``WF_B2`` are stored in
+``self.reservoir_dict`` so they can be adjusted during calibration. A CSV
+under ``core.reservoir_coefficients`` is only an optional seed (or a way to
+supply known parameters when you are not calibrating).
 
 Output files
 ~~~~~~~~~~~~
@@ -716,9 +719,10 @@ example uses the ``etc`` flag group:
        },
    }
 
-- ``RESERVOIRFLAG``: ``1`` reads power-curve coefficients from the parameter
-  file; ``3`` writes the same reservoir file but sets ``WF_B1`` and ``WF_B2``
-  to zero. Omit or set to ``0`` when no lakes are simulated (writes a blank
+- ``RESERVOIRFLAG``: ``1`` uses power-curve coefficients from
+  ``reservoir_dict`` (seeded by CSV and/or ``reservoir_params``); ``3``
+  writes the same reservoir file but sets ``WF_B1`` and ``WF_B2`` to zero.
+  Omit or set to ``0`` when no lakes are simulated (writes a blank
   ``MESH_input_reservoir.txt`` stub).
 
 - ``RESERVOIRFILEFLAG``: ``txt`` (default) or ``tb0``.
@@ -726,10 +730,46 @@ example uses the ``etc`` flag group:
 - ``LOCATIONFLAG``: ``0`` writes integer minute locations; ``1`` writes real
   minute locations with one decimal place.
 
-Coefficient file
-~~~~~~~~~~~~~~~~
+Calibratable parameter dictionary
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Provide the path to a CSV file in ``settings['core']``:
+Like ``class_params`` / ``self.class_dict``, reservoir coefficients live in a
+mutable dictionary exposed as ``self.reservoir_dict`` after
+``init_reservoir()`` (also called from ``run()`` / ``save()``):
+
+.. code-block:: python
+   :linenos:
+
+   "reservoir_params": {
+       "link": "reservoir_id",  # optional; or "basin_id"
+       "reservoirs": {
+           "R-101": {"b1": 0.15, "b2": 0.25, "name": "Ghost Lake"},
+           "R-102": {"b1": 1.0, "b2": 2.0},
+           # optional grouping, same idea as CLASS grus:
+           # ("R-103", "R-104"): {"b1": 0.1, "b2": 0.2},
+       },
+   }
+
+After the workflow builds the dict (from lake catchments, optional CSV, then
+this overlay), calibrate by mutating values in memory:
+
+.. code-block:: python
+   :linenos:
+
+   >>> workflow.run(save_path="mesh_setup")
+   >>> workflow.reservoir_dict["reservoirs"]["R-101"]["b1"] = 0.18
+   >>> workflow.reservoir_dict["reservoirs"]["R-101"]["b2"] = 0.22
+   >>> workflow.save("mesh_setup")  # re-renders from reservoir_dict
+
+Pass ``rebuild=True`` to ``init_reservoir()`` if you need to reconstruct the
+dict from settings/CSV and discard in-memory edits.
+
+Coefficient CSV (optional seed)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Provide a CSV path in ``settings['core']`` when you already know parameters or
+want initial guesses for calibration. CSV values are loaded first; matching
+IDs in ``reservoir_params['reservoirs']`` override them:
 
 .. code-block:: python
    :linenos:
@@ -801,6 +841,8 @@ example, ``COMID``) instead of ``reservoir_id``:
    }
 
 No ``reservoir_id`` entry in ``ddb_vars`` is required for basin linking.
+You can also set ``reservoir_params['link']`` to ``"basin_id"`` or
+``"reservoir_id"``.
 
 Column aliases
 ~~~~~~~~~~~~~~
@@ -841,6 +883,11 @@ Full example
    ...             "reservoir_coefficients": "reservoir_coefficients.csv",
    ...             "reservoir_coefficient_columns": {
    ...                 "reservoir_id": "res_id",
+   ...             },
+   ...         },
+   ...         "reservoir_params": {
+   ...             "reservoirs": {
+   ...                 "R-101": {"b1": 0.15, "b2": 0.25},
    ...             },
    ...         },
    ...         "run_options": {
@@ -1140,8 +1187,9 @@ Reservoir flags
    }
 
 - ``RESERVOIRFLAG``: Enable lake/reservoir input. ``1`` uses power-curve
-  coefficients from ``reservoir_coefficients``; ``3`` writes coefficients as
-  zero. See :ref:`reservoir-settings`.
+  coefficients from ``reservoir_dict`` (seeded by CSV and/or
+  ``reservoir_params``); ``3`` writes coefficients as zero. See
+  :ref:`reservoir-settings`.
 
 - ``RESERVOIRFILEFLAG``: ``txt`` for ``MESH_input_reservoir.txt`` (default),
   or ``tb0`` for ``MESH_input_reservoir.tb0``.

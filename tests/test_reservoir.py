@@ -583,3 +583,128 @@ def test_write_reservoir_files_blank_stub_when_disabled(tmp_path):
 
     assert (tmp_path / "MESH_input_reservoir.txt").read_text().startswith("    0")
     assert not (tmp_path / "MESH_input_reservoir.tb0").exists()
+
+
+def test_normalize_reservoir_param_entry_accepts_aliases():
+    normalized = reservoir.normalize_reservoir_param_entry(
+        {"WF_B1": 0.15, "B2": 0.25, "reservoir_name": "Ghost Lake"}
+    )
+    assert normalized == {"b1": 0.15, "b2": 0.25, "name": "Ghost Lake"}
+
+
+def test_coefficients_round_trip_through_reservoir_params(tmp_path):
+    csv_path = tmp_path / "reservoirs.csv"
+    csv_path.write_text(
+        "reservoir_id,name,b1,b2\n"
+        "R-101,Ghost Lake,0.15,0.25\n"
+    )
+    coefficients = read_reservoir_coefficients(str(csv_path), main_id="COMID")
+    params = reservoir.coefficients_to_reservoir_params(
+        coefficients, link_key="reservoir_id"
+    )
+    assert params["R-101"]["b1"] == 0.15
+    assert params["R-101"]["b2"] == 0.25
+    assert params["R-101"]["name"] == "Ghost Lake"
+
+    round_trip = reservoir.reservoir_params_to_coefficients(
+        params, link_key="reservoir_id"
+    )
+    assert float(round_trip.loc["R-101", "b1"]) == 0.15
+    assert float(round_trip.loc["R-101", "b2"]) == 0.25
+
+
+def test_merge_reservoir_params_overlay_overrides_csv_seed():
+    base = {
+        "R-101": {"b1": 0.15, "b2": 0.25, "name": "Ghost Lake"},
+        "R-102": {"b1": 1.0, "b2": 2.0},
+    }
+    overlay = {
+        "R-101": {"b1": 0.18},
+        ("R-102", "R-103"): {"b1": 0.5, "b2": 0.6},
+    }
+    merged = reservoir.merge_reservoir_params(base, overlay)
+    assert merged["R-101"]["b1"] == 0.18
+    assert merged["R-101"]["b2"] == 0.25
+    assert merged["R-101"]["name"] == "Ghost Lake"
+    assert merged["R-102"]["b1"] == 0.5
+    assert merged["R-102"]["b2"] == 0.6
+    assert merged["R-103"]["b1"] == 0.5
+
+
+def test_seed_reservoir_params_from_catchments():
+    cat = pd.DataFrame(
+        {
+            "COMID": [101, 102, 103],
+            "IREACH": [1, 0, 2],
+            "reservoir_id": ["R-101", "R-102", "R-103"],
+        }
+    )
+    params = reservoir.seed_reservoir_params_from_catchments(
+        cat=cat,
+        main_id="COMID",
+        coeff_link_col="reservoir_id",
+    )
+    assert set(params) == {"R-101", "R-103"}
+    assert params["R-101"] == {"b1": 0.0, "b2": 0.0, "name": "R-101"}
+
+
+def test_jinja_reservoir_file_uses_dict_coefficients():
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "reservoir_id": ["R-101"],
+        }
+    )
+    coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
+    coefficients = reservoir.reservoir_params_to_coefficients(
+        {"R-101": {"b1": 0.15, "b2": 0.25, "name": "Ghost Lake"}},
+        link_key="reservoir_id",
+    )
+
+    text = _render_reservoir_file(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        coeff_link_col="reservoir_id",
+        location_flag=1,
+    )
+
+    lines = text.rstrip("\n").splitlines()
+    assert lines[1] == (
+        " 3000.0 -6840.0      0.150      0.250"
+        "                         Ghost Lake    1"
+    )
+
+
+def test_calibrated_dict_updates_rendered_coefficients():
+    cat = pd.DataFrame(
+        {
+            "COMID": [101],
+            "IREACH": [1],
+            "reservoir_id": ["R-101"],
+        }
+    )
+    coords = pd.DataFrame({"COMID": [101], "lat": [50.0], "lon": [-114.0]})
+    params = {
+        "R-101": {"b1": 0.15, "b2": 0.25, "name": "Ghost Lake"},
+    }
+
+    # Calibration iteration: mutate dict in place, then re-render.
+    params["R-101"]["b1"] = 0.18
+    params["R-101"]["b2"] = 0.22
+    coefficients = reservoir.reservoir_params_to_coefficients(
+        params, link_key="reservoir_id"
+    )
+    context = prepare_reservoir_context(
+        cat=cat,
+        coords=coords,
+        main_id="COMID",
+        coefficients=coefficients,
+        coeff_link_col="reservoir_id",
+        location_flag=1,
+    )
+
+    assert context["reservoirs"][0]["b1"] == 0.18
+    assert context["reservoirs"][0]["b2"] == 0.22

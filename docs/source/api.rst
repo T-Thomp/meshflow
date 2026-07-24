@@ -109,6 +109,11 @@ Functions for preparing ``MESH_input_reservoir.txt`` and
    :toctree: generated/
 
    read_reservoir_coefficients
+   coefficients_to_reservoir_params
+   reservoir_params_to_coefficients
+   merge_reservoir_params
+   normalize_reservoir_param_entry
+   seed_reservoir_params_from_catchments
    prepare_reservoir_context
    prepare_reservoir_inflows_context
    parse_reservoir_coefficient_link

@@ -28,6 +28,7 @@ from typing import (
     Optional,
     Tuple,
     List,
+    Mapping,
 )
 
 from importlib import resources
@@ -178,6 +179,16 @@ class MESHWorkflow(object):
         value is 'subbasin', but it can be customized.
     class_text : str
         Generated CLASS configuration text by the `init_class` method.
+    class_dict : dict
+        Calibratable CLASS parameter dictionary built by `init_class`.
+    reservoir_text : str
+        Generated reservoir ``.txt`` contents when that format is active.
+    reservoir_inflows_text : str
+        Generated reservoir ``.tb0`` contents when that format is active.
+    reservoir_dict : dict
+        Calibratable reservoir coefficient dictionary
+        (``{'link_key', 'link_col', 'reservoirs'}``), analogous to
+        ``class_dict``. Seeded from CSV and/or ``settings['reservoir_params']``.
     hydrology_text : str
         Generated hydrology configuration text by the `init_hydrology` method.
     run_options_text : str
@@ -403,6 +414,10 @@ class MESHWorkflow(object):
         self.reservoir_coefficient_columns = _core_settings.get(
             'reservoir_coefficient_columns', {}
         )
+        # Calibratable reservoir parameter dict (CLASS-style). CSV under
+        # core.reservoir_coefficients is an optional seed / known-params input.
+        self.reservoir_params = self.settings.get('reservoir_params', {})
+        self.reservoir_dict = None
 
         # assing inputs read from files
         self._read_input_files()
@@ -1051,7 +1066,9 @@ class MESHWorkflow(object):
     def init_reservoir(
         self,
         return_text: bool = False,
-    ) -> Optional[str]:
+        return_dict: bool = False,
+        rebuild: bool = False,
+    ) -> Optional[Union[str, dict]]:
         """
         Build reservoir input files for lakes and reservoirs.
 
@@ -1064,9 +1081,20 @@ class MESHWorkflow(object):
         default, or ``MESH_input_reservoir.tb0`` when ``RESERVOIRFILEFLAG`` is
         ``tb0``. Only one of these files is produced — not both.
 
-        With ``RESERVOIRFLAG`` ``1``, natural-lake power-curve coefficients are
-        optionally read from ``settings['core']['reservoir_coefficients']``.
-        Coefficients can be joined on a ``reservoir_id`` column mapped through
+        Power-curve coefficients ``WF_B1`` / ``WF_B2`` are held in
+        ``self.reservoir_dict`` (same idea as ``self.class_dict`` for CLASS).
+        Seed values can come from:
+
+        1. ``settings['core']['reservoir_coefficients']`` CSV (optional), and/or
+        2. ``settings['reservoir_params']['reservoirs']`` dictionary.
+
+        Dictionary values override CSV values for matching IDs. After the first
+        build, mutate ``self.reservoir_dict['reservoirs'][id]['b1']`` /
+        ``['b2']`` between calibration iterations and call ``init_reservoir()``
+        again (or ``save()``) to re-render without re-reading the CSV. Pass
+        ``rebuild=True`` to reconstruct the dict from settings/CSV.
+
+        Coefficients are joined on a ``reservoir_id`` column mapped through
         ``ddb_vars`` (default), or on the catchment ``main_id`` when
         ``basin_id`` is specified in ``reservoir_coefficient_columns``. With
         ``RESERVOIRFLAG`` ``3``, the same file is written but ``WF_B1`` and
@@ -1079,15 +1107,19 @@ class MESHWorkflow(object):
         Parameters
         ----------
         return_text : bool, optional
-            If True, return the active reservoir file contents instead of
-            assigning to ``self.reservoir_text`` or
-            ``self.reservoir_inflows_text``.
+            If True, return the active reservoir file contents.
+        return_dict : bool, optional
+            If True, return the calibratable ``reservoir_dict``.
+        rebuild : bool, optional
+            If True, rebuild ``self.reservoir_dict`` from CSV / settings even
+            when a dict already exists. Default False preserves in-memory
+            calibration edits.
 
         Returns
         -------
-        str or None
-            Active reservoir file contents when ``return_text`` is True;
-            otherwise None.
+        str or dict or None
+            File text and/or parameter dict depending on ``return_text`` /
+            ``return_dict``; otherwise None.
         """
         self.reservoir_file_format = self._reservoir_file_format()
 
@@ -1096,6 +1128,15 @@ class MESHWorkflow(object):
             dummy = utility.render_blank_reservoir_template(self._location_flag())
             self.reservoir_text = dummy
             self.reservoir_inflows_text = None
+            self.reservoir_dict = {
+                "link_key": "reservoir_id",
+                "link_col": None,
+                "reservoirs": {},
+            }
+            if return_dict and return_text:
+                return {"text": dummy, "dict": self.reservoir_dict}
+            if return_dict:
+                return self.reservoir_dict
             return dummy if return_text else None
 
         if "IREACH" not in self.cat.columns:
@@ -1104,27 +1145,57 @@ class MESHWorkflow(object):
                 "Run `init_ddb()` first."
             )
 
-        coefficients = None
-        coeff_link_key = "reservoir_id"
-        coeff_link_col = None
-        if self.reservoir_coefficients:
-            coeff_link_key, csv_id_col = utility.parse_reservoir_coefficient_link(
-                self.reservoir_coefficient_columns,
-                self.main_id,
-            )
-            column_kwargs = {
-                key: value
-                for key, value in self.reservoir_coefficient_columns.items()
-                if key not in utility.RESERVOIR_LINK_KEYS
-            }
-            coefficients = utility.read_reservoir_coefficients(
-                csv_path=self.reservoir_coefficients,
-                main_id=self.main_id,
-                link_key=coeff_link_key,
-                id_col=csv_id_col,
-                **column_kwargs,
-            )
+        coeff_link_key, _ = utility.parse_reservoir_coefficient_link(
+            self.reservoir_coefficient_columns,
+            self.main_id,
+        )
+        # Allow reservoir_params to override the link mode explicitly.
+        params_settings = self.reservoir_params or self.settings.get(
+            "reservoir_params", {}
+        )
+        if isinstance(params_settings, dict) and "link" in params_settings:
+            requested_link = str(params_settings["link"]).strip().lower()
+            if requested_link not in utility.RESERVOIR_LINK_KEYS:
+                raise ValueError(
+                    "`reservoir_params['link']` must be one of "
+                    f"{utility.RESERVOIR_LINK_KEYS}; got `{requested_link}`."
+                )
+            coeff_link_key = requested_link
+
+        settings_reservoirs = {}
+        if isinstance(params_settings, Mapping):
+            settings_reservoirs = params_settings.get("reservoirs", {}) or {}
+
+        # Without a dedicated reservoir_id column, seed/calibrate by basin ID
+        # unless the user supplied CSV or reservoir_params that need reservoir_id.
+        if (
+            coeff_link_key == "reservoir_id"
+            and self._reservoir_id_col() is None
+            and not self.reservoir_coefficients
+            and not settings_reservoirs
+        ):
+            coeff_link_key = "basin_id"
+            coeff_link_col = self.main_id
+        else:
             coeff_link_col = self._reservoir_coeff_link_col(coeff_link_key)
+
+        if rebuild or getattr(self, "reservoir_dict", None) is None:
+            self.reservoir_dict = self._build_reservoir_dict(
+                coeff_link_key=coeff_link_key,
+                coeff_link_col=coeff_link_col,
+                params_settings=params_settings,
+            )
+        else:
+            # Keep link metadata in sync; preserve calibrated reservoir values.
+            self.reservoir_dict["link_key"] = coeff_link_key
+            self.reservoir_dict["link_col"] = coeff_link_col
+            if "reservoirs" not in self.reservoir_dict:
+                self.reservoir_dict["reservoirs"] = {}
+
+        coefficients = utility.reservoir_params_to_coefficients(
+            self.reservoir_dict.get("reservoirs", {}),
+            link_key=self.reservoir_dict["link_key"],
+        )
 
         reservoir_context = utility.prepare_reservoir_context(
             cat=self.cat,
@@ -1136,8 +1207,8 @@ class MESHWorkflow(object):
             use_power_coefficients=self._reservoir_flag() == 1,
             lake_area_col=self._lake_area_col(),
             subbasin_areas=self._subbasin_areas(),
-            coeff_link_key=coeff_link_key,
-            coeff_link_col=coeff_link_col,
+            coeff_link_key=self.reservoir_dict["link_key"],
+            coeff_link_col=self.reservoir_dict["link_col"],
         )
         self.reservoir_text = None
         self.reservoir_inflows_text = None
@@ -1159,11 +1230,82 @@ class MESHWorkflow(object):
                 reservoir_context
             )
 
+        if return_dict and return_text:
+            text = (
+                self.reservoir_inflows_text
+                if self.reservoir_file_format == "tb0"
+                else self.reservoir_text
+            )
+            return {"text": text, "dict": self.reservoir_dict}
+        if return_dict:
+            return self.reservoir_dict
         if return_text:
             if self.reservoir_file_format == "tb0":
                 return self.reservoir_inflows_text
             return self.reservoir_text
         return None
+
+    def _build_reservoir_dict(
+        self,
+        coeff_link_key: str,
+        coeff_link_col: str,
+        params_settings: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build the calibratable reservoir parameter dictionary.
+
+        Order of application:
+
+        1. Zero-coefficient seeds for every lake catchment.
+        2. Optional CSV from ``settings['core']['reservoir_coefficients']``.
+        3. Optional ``settings['reservoir_params']['reservoirs']`` overlay.
+        """
+        reservoirs = utility.seed_reservoir_params_from_catchments(
+            cat=self.cat,
+            main_id=self.main_id,
+            lake_col="IREACH",
+            coeff_link_key=coeff_link_key,
+            coeff_link_col=coeff_link_col,
+        )
+
+        if self.reservoir_coefficients:
+            column_kwargs = {
+                key: value
+                for key, value in self.reservoir_coefficient_columns.items()
+                if key not in utility.RESERVOIR_LINK_KEYS
+            }
+            _, csv_id_col = utility.parse_reservoir_coefficient_link(
+                self.reservoir_coefficient_columns,
+                self.main_id,
+            )
+            coefficients = utility.read_reservoir_coefficients(
+                csv_path=self.reservoir_coefficients,
+                main_id=self.main_id,
+                link_key=coeff_link_key,
+                id_col=csv_id_col,
+                **column_kwargs,
+            )
+            reservoirs = utility.merge_reservoir_params(
+                reservoirs,
+                utility.coefficients_to_reservoir_params(
+                    coefficients, link_key=coeff_link_key
+                ),
+            )
+
+        if params_settings is None:
+            params_settings = self.reservoir_params or {}
+        settings_reservoirs = {}
+        if isinstance(params_settings, Mapping):
+            settings_reservoirs = params_settings.get("reservoirs", {}) or {}
+        reservoirs = utility.merge_reservoir_params(
+            reservoirs, settings_reservoirs
+        )
+
+        return {
+            "link_key": coeff_link_key,
+            "link_col": coeff_link_col,
+            "reservoirs": reservoirs,
+        }
 
     def _read_reservoir_file_format_raw(self) -> Any:
         """Return the configured ``RESERVOIRFILEFLAG`` value, if present."""
@@ -2399,15 +2541,14 @@ class MESHWorkflow(object):
         """
         Write the active reservoir input file and remove the unused format.
 
+        Re-renders from ``self.reservoir_dict`` when present so calibration
+        edits are picked up on ``save()`` without rewriting the CSV.
+
         ``RESERVOIRFLAG`` missing/``0`` → blank ``MESH_input_reservoir.txt``.
         Enabled + ``txt`` → formatted ``.txt`` only.
         Enabled + ``tb0`` → formatted ``.tb0`` only (no blank ``.txt``).
         """
-        if (
-            getattr(self, 'reservoir_text', None) is None
-            and getattr(self, 'reservoir_inflows_text', None) is None
-        ):
-            self.init_reservoir()
+        self.init_reservoir()
 
         utility.write_reservoir_output_files(
             output_dir,
