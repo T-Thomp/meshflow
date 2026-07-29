@@ -844,7 +844,8 @@ class MESHWorkflow(object):
           during initialization.
         - For single forcing files, the forcing object is created but not
           saved automatically.
-        - Generates CLASS, hydrology, and run options configuration files.
+        - Generates CLASS, hydrology, run options, and reservoir configuration
+          files via ``render_configs()``.
         """
         # Initialize drainage database and forcing objects
         self.init()
@@ -889,11 +890,13 @@ class MESHWorkflow(object):
             return_ds=True,
             routing_process_params=included_processes)
 
-        # Render configuration texts for the MESH instance
+        # Render configuration texts for the MESH instance (CLASS, hydrology,
+        # run options, and reservoirs)
         self.class_text, self.hydrology_text, self.run_options_text, self.parameters_ds = self.render_configs(
             class_dicts=self.class_dict, # type: ignore
             hydrology_dicts=self.hydrology_dict, # type: ignore
             options_dict=self.options_dict, # type: ignore
+            reservoir_dicts=self.reservoir_dict,
             process_details=included_processes,
             return_texts=True,
             return_ds=True
@@ -901,8 +904,6 @@ class MESHWorkflow(object):
 
         # Generate a parameters file for MESH (MESH_parameters.nc)
         # FIXME: needs to be generalized later on to accept soil parameters as well
-
-        self.init_reservoir()
 
         return
 
@@ -1090,8 +1091,10 @@ class MESHWorkflow(object):
 
         Dictionary values override CSV values for matching IDs. After the first
         build, mutate ``self.reservoir_dict['reservoirs'][id]['b1']`` /
-        ``['b2']`` between calibration iterations and call ``init_reservoir()``
-        again (or ``save()``) to re-render without re-reading the CSV. Pass
+        ``['b2']`` between calibration iterations and call
+        ``render_configs()`` (or ``init_reservoir()`` alone) to refresh
+        ``self.reservoir_text`` / ``self.reservoir_inflows_text``, then
+        ``save()`` to write those strings — same pattern as CLASS. Pass
         ``rebuild=True`` to reconstruct the dict from settings/CSV.
 
         Coefficients are joined on a ``reservoir_id`` column mapped through
@@ -2339,12 +2342,14 @@ class MESHWorkflow(object):
         class_dicts: Dict[str, Dict[str, Any]],
         hydrology_dicts: Dict[str, Dict[str, Any]],
         options_dict: Dict[str, Any],
+        reservoir_dicts: Optional[Dict[str, Any]] = None,
         process_details: Optional[Dict[str, List]] = None,
         return_texts: Optional[bool] = False,
         return_ds: Optional[bool] = False,
     ) -> Optional[Tuple[str, str, str]]:
         """
-        Render configuration texts for CLASS, hydrology, and run options.
+        Render configuration texts for CLASS, hydrology, run options, and
+        reservoirs.
 
         Parameters
         ----------
@@ -2358,6 +2363,13 @@ class MESHWorkflow(object):
             `hydrology_info` and `hydrology_case` (key names).
         options_dict : dict
             Dictionary containing run options configuration parameters.
+        reservoir_dicts : dict, optional
+            Calibratable reservoir dictionary
+            (``{'link_key', 'link_col', 'reservoirs'}``), analogous to
+            ``class_dicts``. When provided, assigned to
+            ``self.reservoir_dict`` before rendering. When omitted, uses
+            the existing ``self.reservoir_dict`` (built on first
+            ``init_reservoir()`` if needed).
         process_details : dict, optional
             Dictionary defining process details, including necessary hydrology
             and routing parameters for each process. If provided, it will be
@@ -2375,13 +2387,16 @@ class MESHWorkflow(object):
         -------
         Tuple[str, str, str]
             A tuple containing the rendered configuration texts for CLASS,
-            hydrology, and run options.
+            hydrology, and run options. Reservoir strings are stored on
+            ``self.reservoir_text`` / ``self.reservoir_inflows_text``.
 
         Notes
         -----
         - Utilizes utility functions to render configuration texts based on
           provided dictionaries created via `init_class`, `init_hydrology`,
           and `init_options` methods.
+        - Also calls ``init_reservoir()`` so reservoir dict edits are
+          reflected before ``save()`` (same calibration pattern as CLASS).
         - Users can directly use this function if the configuration dictionaries
           are created externally.
         """
@@ -2391,6 +2406,8 @@ class MESHWorkflow(object):
                 not isinstance(options_dict, dict):
             raise ValueError("`class_dicts`, `hydrology_dicts`, and `options_dict` "
                              "must be dictionaries")
+        if reservoir_dicts is not None and not isinstance(reservoir_dicts, dict):
+            raise ValueError("`reservoir_dicts` must be a dictionary or None")
 
         # render CLASS configuration text
         # Note: inplace updates on `class_dicts` will be reflected after
@@ -2427,6 +2444,11 @@ class MESHWorkflow(object):
         #        lower legibility and maintainability. This will be further
         #        developed to be more coherent and clear in the future.
         self.options_text = utility.render_run_options_template(options_dict)
+
+        # Render reservoir input text (same idea as CLASS/hydrology above).
+        if reservoir_dicts is not None:
+            self.reservoir_dict = reservoir_dicts
+        self.init_reservoir()
 
         # if `flz` and `pwr` are the only ones in the `process_details.routing` list,
         # that means the `MESH_parameters.nc` needs to be printed as well
@@ -2467,6 +2489,9 @@ class MESHWorkflow(object):
         - If multiple forcing files are used, a list of their paths is saved as 'forcing_files_list.txt'.
         - Default setting files from the package are copied to the output directory.
         - Additional configuration files such as CLASS, hydrology, and run options are saved as .ini files.
+        - Reservoir files are written from already-rendered ``reservoir_text`` /
+          ``reservoir_inflows_text``. Call ``render_configs()`` first if you
+          mutated ``reservoir_dict`` (or ``class_dict`` / hydrology dicts).
         """
         # Make the final output directory absolute
         output_dir = os.path.abspath(output_dir)
@@ -2541,15 +2566,16 @@ class MESHWorkflow(object):
         """
         Write the active reservoir input file and remove the unused format.
 
-        Re-renders from ``self.reservoir_dict`` when present so calibration
-        edits are picked up on ``save()`` without rewriting the CSV.
+        Writes already-rendered ``self.reservoir_text`` /
+        ``self.reservoir_inflows_text`` (same idea as writing ``self.class_text``
+        for CLASS). Call ``render_configs()`` (or ``init_reservoir()``) after
+        mutating ``self.reservoir_dict`` so those strings are refreshed before
+        ``save()``.
 
-        ``RESERVOIRFLAG`` missing/``0`` → blank ``MESH_input_reservoir.txt``.
-        Enabled + ``txt`` → formatted ``.txt`` only.
-        Enabled + ``tb0`` → formatted ``.tb0`` only (no blank ``.txt``).
+        Prefer ``reservoir_inflows_text`` (``.tb0``) when set, otherwise
+        ``reservoir_text`` (``.txt``). If neither is set, write a blank
+        ``MESH_input_reservoir.txt`` stub.
         """
-        self.init_reservoir()
-
         utility.write_reservoir_output_files(
             output_dir,
             reservoir_text=getattr(self, 'reservoir_text', None),
@@ -2629,15 +2655,22 @@ class MESHWorkflow(object):
         output_col: str = "IREACH",
     ) -> None:
         """
-        Build MESH IREACH on catchments from a 0/1 lake flag.
-    Lakes are numbered 1, 2, 3, ... in river traversal order
-        (``self.main_seg``). Non-lake basins get 0.
+        Build MESH IREACH on catchments from a lake indicator column.
+
+        Non-lake sentinels are ``0`` and ``-1`` (and ``NaN``). Any other value
+        is treated as a lake, so binary flags, lake areas, or lake IDs can be
+        mapped through ``ddb_vars['ireach']``. Lakes are numbered
+        ``1, 2, 3, ...`` in river traversal order (``self.main_seg``).
+        Non-lake basins get ``0``.
+
         Parameters
         ----------
         lake_col : str
-            Column on ``self.cat`` with lake indicator (0 = not lake, non-zero = lake).
+            Column on ``self.cat`` with lake indicator (``0`` / ``-1`` = not
+            lake; any other value = lake).
         output_col : str, optional
             Column name written on ``self.cat`` (default ``IREACH``).
+
         Notes
         -----
         Call from ``init_ddb()`` after ``init()`` so ``self.main_seg`` exists.
@@ -2656,8 +2689,7 @@ class MESHWorkflow(object):
         # One value per basin ID (warn if duplicates disagree)
         if lake_by_id.index.duplicated().any():
             lake_by_id = lake_by_id.groupby(level=0).max()
-        lake_by_id = lake_by_id.fillna(0)
-        lake_by_id = (lake_by_id != 0).astype(np.int32)
+        lake_by_id = utility.normalize_lake_indicator(lake_by_id)
         # Unique basin IDs in river order; number lakes 1..N
         ireach_map = {}
         next_id = 1

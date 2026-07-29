@@ -48,6 +48,17 @@ def _expand_grouped_keys(mapping: Mapping[Any, Any]) -> Dict[Any, Any]:
     return expand_grouped_keys(dict(mapping))
 
 
+def normalize_lake_indicator(values: pd.Series) -> pd.Series:
+    """
+    Convert a lake indicator / lake-ID column to 0/1 flags.
+
+    Non-lake sentinels are ``0``, ``-1``, and ``NaN``. Any other value is
+    treated as a lake (for example a positive lake area or lake ID).
+    """
+    filled = values.fillna(0)
+    return ((filled != 0) & (filled != -1)).astype("int32")
+
+
 def degrees_to_mesh_minutes(degrees: float) -> float:
     """Convert decimal degrees to MESH north-south/east-west minutes."""
     return float(degrees) * 60.0

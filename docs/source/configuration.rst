@@ -278,15 +278,18 @@ Lakes and Reservoirs
 ^^^^^^^^^^^^^^^^^^^^
 
 To include lakes in a MESH setup, the catchment shapefile should contain a
-column that flags lake subbasins (for example, ``1`` for lake, ``0`` for
-non-lake). Map that column through ``ddb_vars`` using the ``ireach`` key.
-``MESHFlow`` computes the ``IREACH`` index on each lake subbasin during
-``init_ddb()`` and writes it to the drainage database.
+column that identifies lake subbasins. Non-lake values may be ``0`` or
+``-1``; any other value is treated as a lake (for example ``1``/``0`` flags,
+positive lake areas, or lake IDs with ``-1`` for non-lakes). Map that column
+through ``ddb_vars`` using the ``ireach`` key. ``MESHFlow`` computes the
+``IREACH`` index on each lake subbasin during ``init_ddb()`` and writes it
+to the drainage database.
 
 Optional catchment columns for reservoir workflows:
 
 - ``ireach``: Lake indicator column on the catchment shapefile. Required
-  when generating reservoir input files.
+  when generating reservoir input files. Accepts binary flags, lake area
+  (``0`` = non-lake), or lake IDs (``-1`` / ``0`` = non-lake).
 
 - ``reservoir_id``: Reservoir identifier column on the catchment shapefile.
   Used by default to join power-curve coefficients from a parameter CSV to
@@ -735,7 +738,7 @@ Calibratable parameter dictionary
 
 Like ``class_params`` / ``self.class_dict``, reservoir coefficients live in a
 mutable dictionary exposed as ``self.reservoir_dict`` after
-``init_reservoir()`` (also called from ``run()`` / ``save()``):
+``init_reservoir()`` (also called from ``run()``):
 
 .. code-block:: python
    :linenos:
@@ -751,7 +754,9 @@ mutable dictionary exposed as ``self.reservoir_dict`` after
    }
 
 After the workflow builds the dict (from lake catchments, optional CSV, then
-this overlay), calibrate by mutating values in memory:
+this overlay), calibrate by mutating values in memory, re-rendering via
+``render_configs()``, then saving — the same path used for CLASS and
+hydrology:
 
 .. code-block:: python
    :linenos:
@@ -759,7 +764,15 @@ this overlay), calibrate by mutating values in memory:
    >>> workflow.run(save_path="mesh_setup")
    >>> workflow.reservoir_dict["reservoirs"]["R-101"]["b1"] = 0.18
    >>> workflow.reservoir_dict["reservoirs"]["R-101"]["b2"] = 0.22
-   >>> workflow.save("mesh_setup")  # re-renders from reservoir_dict
+   >>> workflow.render_configs(
+   ...     class_dicts=workflow.class_dict,
+   ...     hydrology_dicts=workflow.hydrology_dict,
+   ...     options_dict=workflow.options_dict,
+   ...     reservoir_dicts=workflow.reservoir_dict,
+   ...     return_texts=True,
+   ...     return_ds=True,
+   ... )
+   >>> workflow.save("mesh_setup")  # writes the already-rendered strings
 
 Pass ``rebuild=True`` to ``init_reservoir()`` if you need to reconstruct the
 dict from settings/CSV and discard in-memory edits.
@@ -903,10 +916,11 @@ Full example
 
 .. note::
 
-   Run ``init_ddb()`` before ``init_reservoir()``. The workflow calls
-   ``init_reservoir()`` automatically when saving outputs if ``ireach`` is
-   present in ``ddb_vars`` and ``IREACH`` has been computed on the
-   catchment data.
+   Run ``init_ddb()`` before rendering reservoirs. ``run()`` builds
+   ``IREACH`` then calls ``render_configs()``, which includes
+   ``init_reservoir()``. ``save()`` only writes the already-rendered
+   reservoir strings; after editing ``reservoir_dict`` (or CLASS /
+   hydrology dicts), call ``render_configs()`` again before saving.
 
 .. note::
 

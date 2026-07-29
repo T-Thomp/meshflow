@@ -32,12 +32,17 @@ format_reservoir_header = reservoir.format_reservoir_header
 format_reservoir_line = reservoir.format_reservoir_line
 fortran_i5 = reservoir.fortran_i5
 fortran_f7_1 = reservoir.fortran_f7_1
+normalize_lake_indicator = reservoir.normalize_lake_indicator
 prepare_reservoir_context = reservoir.prepare_reservoir_context
 prepare_reservoir_inflows_context = reservoir.prepare_reservoir_inflows_context
 read_reservoir_coefficients = reservoir.read_reservoir_coefficients
 parse_reservoir_coefficient_link = reservoir.parse_reservoir_coefficient_link
 
 
+def test_normalize_lake_indicator_accepts_flags_area_and_lake_ids():
+    values = pd.Series([0, 1, -1, 42, 1.5e6, None])
+    flags = normalize_lake_indicator(values)
+    assert list(flags) == [0, 1, 0, 1, 1, 0]
 def render_reservoir_template(context: dict) -> str:
     """Render the production Jinja template using the same filters as meshflow."""
     env = Environment(
